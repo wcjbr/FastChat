@@ -58,8 +58,12 @@ jobs:
           EOF
           cp AppDir/fast-chat.desktop AppDir/usr/share/applications/fast-chat.desktop
           mkdir -p AppDir/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules
-          find /usr/lib -path '*/gtk-3.0/3.0.0/immodules/*.so' -exec cp -n {} AppDir/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules/ \;
-          gtk-query-immodules-3.0 AppDir/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules/*.so > AppDir/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache
+          find /usr/lib -path '*/gtk-3.0/3.0.0/immodules/*.so' -exec cp --update=none {} AppDir/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules/ \;
+          GTK_QUERY_IMMODULES="$(command -v gtk-query-immodules-3.0 || true)"
+          if [ -z "$GTK_QUERY_IMMODULES" ]; then
+            GTK_QUERY_IMMODULES="/usr/lib/x86_64-linux-gnu/gtk-3.0/gtk-query-immodules-3.0"
+          fi
+          "$GTK_QUERY_IMMODULES" AppDir/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules/*.so > AppDir/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache
           cat > AppDir/AppRun <<'EOF'
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "$0")")"
