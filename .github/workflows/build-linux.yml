@@ -61,7 +61,11 @@ jobs:
           find /usr/lib -path '*/gtk-3.0/3.0.0/immodules/*.so' -exec cp --update=none {} AppDir/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules/ \;
           GTK_QUERY_IMMODULES="$(command -v gtk-query-immodules-3.0 || true)"
           if [ -z "$GTK_QUERY_IMMODULES" ]; then
-            GTK_QUERY_IMMODULES="/usr/lib/x86_64-linux-gnu/gtk-3.0/gtk-query-immodules-3.0"
+            GTK_QUERY_IMMODULES="$(find /usr -name gtk-query-immodules-3.0 -type f -print -quit)"
+          fi
+          if [ -z "$GTK_QUERY_IMMODULES" ]; then
+            echo "gtk-query-immodules-3.0 not found"
+            exit 1
           fi
           "$GTK_QUERY_IMMODULES" AppDir/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules/*.so > AppDir/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache
           cat > AppDir/AppRun <<'EOF'
