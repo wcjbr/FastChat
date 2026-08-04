@@ -13,6 +13,8 @@ class ChatNetworkService {
   final _roomController = StreamController<List<DiscoveredRoom>>.broadcast();
   final _hostedRoomController =
       StreamController<List<DiscoveredRoom>>.broadcast();
+  final _joinedRoomController =
+      StreamController<List<DiscoveredRoom>>.broadcast();
   final _messageController = StreamController<ChatMessage>.broadcast();
   final _transferController = StreamController<FileTransferStatus>.broadcast();
   final _discovered = <String, DiscoveredRoom>{};
@@ -28,6 +30,7 @@ class ChatNetworkService {
 
   Stream<List<DiscoveredRoom>> get rooms => _roomController.stream;
   Stream<List<DiscoveredRoom>> get hostedRooms => _hostedRoomController.stream;
+  Stream<List<DiscoveredRoom>> get joinedRooms => _joinedRoomController.stream;
   Stream<ChatMessage> get messages => _messageController.stream;
   Stream<FileTransferStatus> get transfers => _transferController.stream;
   String get roomId => _activeRoomId ?? '';
@@ -106,10 +109,6 @@ class ChatNetworkService {
   }) async {
     await startDiscovery();
     _displayName = displayName.isEmpty ? '访客' : displayName;
-    final activeState = _rooms[_activeRoomId];
-    if (activeState != null && activeState.server == null) {
-      await leaveRoom();
-    }
     if (_rooms.containsKey(room.id)) {
       await _closeRoom(room.id);
     }
@@ -145,6 +144,8 @@ class ChatNetworkService {
       _emitHostedRooms();
       _ensureAnnouncing();
     }
+    _emitJoinedRooms();
+    _emitDiscoveredRooms();
   }
 
   Future<void> send(String text, {required String sender}) async {
@@ -163,7 +164,11 @@ class ChatNetworkService {
     final encoded = '${jsonEncode(packet)}\n';
     _seenMessages.add(packet['id'] as String);
     _messageController.add(
-      ChatMessage(sender: packet['sender'] as String, text: text),
+      ChatMessage(
+        sender: packet['sender'] as String,
+        text: text,
+        roomId: roomId,
+      ),
     );
     await _sendPacket(state, encoded);
   }
@@ -198,6 +203,7 @@ class ChatNetworkService {
       ChatMessage(
         sender: displayName,
         text: '发送了文件：$fileName',
+        roomId: roomId,
         fileName: fileName,
         fileSize: fileSize,
         fileData: base64Data,
@@ -276,6 +282,7 @@ class ChatNetworkService {
     _udp?.close();
     await _roomController.close();
     await _hostedRoomController.close();
+    await _joinedRoomController.close();
     await _messageController.close();
     await _transferController.close();
   }
@@ -323,6 +330,7 @@ class ChatNetworkService {
             ChatMessage(
               sender: packet['sender'] ?? '访客',
               text: packet['text'] ?? '',
+              roomId: roomId,
             ),
           );
         } else if (type == 'file-start') {
@@ -381,6 +389,7 @@ class ChatNetworkService {
             ChatMessage(
               sender: transfer.sender,
               text: '发送了文件：${transfer.fileName}',
+              roomId: roomId,
               fileName: transfer.fileName,
               fileSize: transfer.fileSize,
               fileData: base64Encode(bytes),
@@ -462,6 +471,7 @@ class ChatNetworkService {
     }
     await state.close();
     _emitHostedRooms();
+    _emitJoinedRooms();
     _emitDiscoveredRooms();
     _stopAnnouncingIfIdle();
   }
@@ -486,6 +496,7 @@ class ChatNetworkService {
       return;
     }
     _emitHostedRooms();
+    _emitJoinedRooms();
   }
 
   void _emitDiscoveredRooms() {
@@ -496,10 +507,18 @@ class ChatNetworkService {
 
   void _emitHostedRooms() {
     final hosted = _rooms.values
-        .where((room) => room.server != null)
+        .where((room) => room.server != null && !room.relayNode)
         .map((room) => room.room)
         .toList();
     _hostedRoomController.add(hosted);
+  }
+
+  void _emitJoinedRooms() {
+    final joined = _rooms.values
+        .where((room) => room.upstream != null)
+        .map((room) => room.room)
+        .toList();
+    _joinedRoomController.add(joined);
   }
 
   void _announce() {

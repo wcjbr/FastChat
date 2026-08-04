@@ -20,12 +20,14 @@ class ChatMessage {
     required this.sender,
     required this.text,
     this.system = false,
+    this.roomId,
     this.fileName,
     this.fileSize,
     this.fileData,
   });
   final String sender, text;
   final bool system;
+  final String? roomId;
   final String? fileName;
   final int? fileSize;
   final String? fileData;
@@ -61,6 +63,7 @@ class FileTransferStatus {
 class ChatNetworkService {
   final rooms = const Stream<List<DiscoveredRoom>>.empty();
   final hostedRooms = const Stream<List<DiscoveredRoom>>.empty();
+  final joinedRooms = const Stream<List<DiscoveredRoom>>.empty();
   final messages = const Stream<ChatMessage>.empty();
   final transfers = const Stream<FileTransferStatus>.empty();
   String get roomId => '';
