@@ -2,14 +2,18 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 import 'network_service_stub.dart';
 
 class ChatNetworkService {
   static const _discoveryPort = 45454;
+  static const int _fileChunkSize = 48 * 1024;
   final _roomController = StreamController<List<DiscoveredRoom>>.broadcast();
   final _messageController = StreamController<ChatMessage>.broadcast();
+  final _transferController = StreamController<FileTransferStatus>.broadcast();
   final _found = <String, DiscoveredRoom>{};
   final _seenMessages = <String>{};
+  final _incomingFiles = <String, _IncomingFileTransfer>{};
   final _clients = <WebSocket>[];
   RawDatagramSocket? _udp;
   StreamSubscription<RawSocketEvent>? _udpSubscription;
@@ -25,6 +29,7 @@ class ChatNetworkService {
 
   Stream<List<DiscoveredRoom>> get rooms => _roomController.stream;
   Stream<ChatMessage> get messages => _messageController.stream;
+  Stream<FileTransferStatus> get transfers => _transferController.stream;
   String get roomId => _roomId;
   int get port => _server?.port ?? 0;
 
@@ -105,12 +110,91 @@ class ChatNetworkService {
           continue;
         }
         _seenMessages.add(id);
-        if (packet['type'] == 'message') {
-          final message = ChatMessage(
-            sender: packet['sender'] ?? '访客',
-            text: packet['text'] ?? '',
+        final type = packet['type'];
+        if (type == 'message') {
+          _messageController.add(
+            ChatMessage(
+              sender: packet['sender'] ?? '访客',
+              text: packet['text'] ?? '',
+            ),
           );
-          _messageController.add(message);
+        } else if (type == 'file-start') {
+          final transferId = packet['transferId']?.toString();
+          if (transferId == null) continue;
+          _incomingFiles[transferId] = _IncomingFileTransfer(
+            sender: packet['sender'] ?? '访客',
+            fileName: packet['fileName'] ?? '文件',
+            fileSize: packet['fileSize'] ?? 0,
+            totalChunks: packet['totalChunks'] ?? 0,
+          );
+          _transferController.add(
+            FileTransferStatus(
+              transferId: transferId,
+              fileName: packet['fileName'] ?? '文件',
+              sender: packet['sender'] ?? '访客',
+              totalBytes: packet['fileSize'] ?? 0,
+              transferredBytes: 0,
+              incoming: true,
+              phase: 'receiving',
+            ),
+          );
+        } else if (type == 'file-chunk') {
+          final transferId = packet['transferId']?.toString();
+          final chunkData = packet['data']?.toString();
+          if (transferId == null || chunkData == null) continue;
+          final transfer = _incomingFiles.putIfAbsent(
+            transferId,
+            () => _IncomingFileTransfer(
+              sender: packet['sender'] ?? '访客',
+              fileName: packet['fileName'] ?? '文件',
+              fileSize: packet['fileSize'] ?? 0,
+              totalChunks: packet['totalChunks'] ?? 0,
+            ),
+          );
+          final chunkBytes = base64Decode(chunkData);
+          transfer.addChunk(chunkBytes);
+          _transferController.add(
+            FileTransferStatus(
+              transferId: transferId,
+              fileName: transfer.fileName,
+              sender: transfer.sender,
+              totalBytes: transfer.fileSize,
+              transferredBytes: transfer.receivedBytes,
+              incoming: true,
+              phase: 'receiving',
+            ),
+          );
+        } else if (type == 'file-end') {
+          final transferId = packet['transferId']?.toString();
+          if (transferId == null) continue;
+          final transfer = _incomingFiles.remove(transferId);
+          if (transfer == null) continue;
+          final bytes = transfer.bytes.toBytes();
+          _messageController.add(
+            ChatMessage(
+              sender: transfer.sender,
+              text: '发送了文件：${transfer.fileName}',
+              fileName: transfer.fileName,
+              fileSize: transfer.fileSize,
+              fileData: base64Encode(bytes),
+            ),
+          );
+          _transferController.add(
+            FileTransferStatus(
+              transferId: transferId,
+              fileName: transfer.fileName,
+              sender: transfer.sender,
+              totalBytes: transfer.fileSize,
+              transferredBytes: transfer.fileSize,
+              incoming: true,
+              phase: 'done',
+            ),
+          );
+        }
+        if (type == 'message' ||
+            type == 'file-start' ||
+            type == 'file-chunk' ||
+            type == 'file-end') {
           if (_relay) {
             final encoded = '${jsonEncode(packet)}\n';
             for (final client in List<WebSocket>.from(_clients)) {
@@ -190,6 +274,117 @@ class ChatNetworkService {
     }
   }
 
+  Future<void> sendFile({
+    required String sender,
+    required String fileName,
+    required int fileSize,
+    required String base64Data,
+  }) async {
+    final bytes = base64Decode(base64Data);
+    final transferId =
+        '${DateTime.now().microsecondsSinceEpoch}-${Random().nextInt(999999)}';
+    final totalChunks = (bytes.length / _fileChunkSize).ceil();
+    final displayName = sender.isEmpty ? _displayName : sender;
+    _transferController.add(
+      FileTransferStatus(
+        transferId: transferId,
+        fileName: fileName,
+        sender: displayName,
+        totalBytes: fileSize,
+        transferredBytes: 0,
+        incoming: false,
+        phase: 'sending',
+      ),
+    );
+    _messageController.add(
+      ChatMessage(
+        sender: displayName,
+        text: '发送了文件：$fileName',
+        fileName: fileName,
+        fileSize: fileSize,
+        fileData: base64Data,
+      ),
+    );
+
+    final packet = {
+      'type': 'file-start',
+      'id': '$transferId-start',
+      'transferId': transferId,
+      'sender': displayName,
+      'text': '发送了文件：$fileName',
+      'fileName': fileName,
+      'fileSize': fileSize,
+      'chunkSize': _fileChunkSize,
+      'totalChunks': totalChunks,
+      'time': DateTime.now().toIso8601String(),
+    };
+    await _sendPacket(packet);
+
+    for (var index = 0; index < totalChunks; index++) {
+      final start = index * _fileChunkSize;
+      final end = min(start + _fileChunkSize, bytes.length);
+      final chunk = bytes.sublist(start, end);
+      await _sendPacket({
+        'type': 'file-chunk',
+        'id': '$transferId-chunk-$index',
+        'transferId': transferId,
+        'sender': displayName,
+        'fileName': fileName,
+        'fileSize': fileSize,
+        'totalChunks': totalChunks,
+        'index': index,
+        'data': base64Encode(chunk),
+        'time': DateTime.now().toIso8601String(),
+      });
+      _transferController.add(
+        FileTransferStatus(
+          transferId: transferId,
+          fileName: fileName,
+          sender: displayName,
+          totalBytes: fileSize,
+          transferredBytes: min(end, fileSize),
+          incoming: false,
+          phase: 'sending',
+        ),
+      );
+    }
+
+    await _sendPacket({
+      'type': 'file-end',
+      'id': '$transferId-end',
+      'transferId': transferId,
+      'sender': displayName,
+      'fileName': fileName,
+      'fileSize': fileSize,
+      'totalChunks': totalChunks,
+      'time': DateTime.now().toIso8601String(),
+    });
+    _transferController.add(
+      FileTransferStatus(
+        transferId: transferId,
+        fileName: fileName,
+        sender: displayName,
+        totalBytes: fileSize,
+        transferredBytes: fileSize,
+        incoming: false,
+        phase: 'done',
+      ),
+    );
+  }
+
+  Future<void> _sendPacket(Map<String, dynamic> packet) async {
+    final encoded = '${jsonEncode(packet)}\n';
+    _seenMessages.add(packet['id'] as String);
+    if (_hosting) {
+      for (final client in List<WebSocket>.from(_clients)) {
+        client.add(encoded);
+      }
+      _socket?.add(encoded);
+    } else {
+      _socket?.add(encoded);
+    }
+  }
+
   void _announce() {
     if (!_hosting || _udp == null || _server == null) return;
     final packet = utf8.encode(
@@ -230,5 +425,27 @@ class ChatNetworkService {
     _udp?.close();
     await _roomController.close();
     await _messageController.close();
+    await _transferController.close();
+  }
+}
+
+class _IncomingFileTransfer {
+  _IncomingFileTransfer({
+    required this.sender,
+    required this.fileName,
+    required this.fileSize,
+    required this.totalChunks,
+  });
+
+  final String sender;
+  final String fileName;
+  final int fileSize;
+  final int totalChunks;
+  final BytesBuilder bytes = BytesBuilder(copy: false);
+  int receivedBytes = 0;
+
+  void addChunk(List<int> chunk) {
+    bytes.add(chunk);
+    receivedBytes += chunk.length;
   }
 }

@@ -1,6 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:open_file/open_file.dart';
+import 'package:path_provider/path_provider.dart';
 import 'network/network_service.dart';
+import 'notifications/notification_service.dart';
 
 void main() => runApp(const FastChatApp());
 
@@ -35,17 +41,20 @@ class _ChatHomePageState extends State<ChatHomePage> {
   final _messageController = TextEditingController();
   final _roomController = TextEditingController();
   final _nameController = TextEditingController(text: '访客');
+  final _messagesScrollController = ScrollController();
   final List<ChatMessage> _messages = [
     ChatMessage(sender: '系统', text: '欢迎使用 Fast Chat，正在扫描局域网聊天室。', system: true),
   ];
   StreamSubscription? _roomsSub;
   StreamSubscription? _messagesSub;
+  StreamSubscription? _transfersSub;
   List<DiscoveredRoom> _rooms = [];
   DiscoveredRoom? _activeRoom;
   bool _relayEnabled = true;
   bool _scanning = true;
   String? _error;
   Timer? _scanTimer;
+  final Map<String, FileTransferStatus> _transfers = {};
 
   @override
   void initState() {
@@ -54,8 +63,17 @@ class _ChatHomePageState extends State<ChatHomePage> {
       if (mounted) setState(() => _rooms = rooms);
     });
     _messagesSub = _network.messages.listen((message) {
-      if (mounted) setState(() => _messages.add(message));
+      if (mounted) {
+        _appendMessage(message);
+      }
     });
+    _transfersSub = _network.transfers.listen((status) {
+      if (!mounted) return;
+      setState(() {
+        _transfers[status.transferId] = status;
+      });
+    });
+    NotificationService.initialize();
     _network.startDiscovery();
     _scanTimer = Timer(const Duration(seconds: 4), () {
       if (mounted) {
@@ -68,12 +86,42 @@ class _ChatHomePageState extends State<ChatHomePage> {
   void dispose() {
     _roomsSub?.cancel();
     _messagesSub?.cancel();
+    _transfersSub?.cancel();
     _scanTimer?.cancel();
     _network.dispose();
     _messageController.dispose();
     _roomController.dispose();
     _nameController.dispose();
+    _messagesScrollController.dispose();
     super.dispose();
+  }
+
+  void _appendMessage(ChatMessage message) {
+    setState(() => _messages.add(message));
+    final currentName = _nameController.text.trim();
+    if (!message.system &&
+        message.sender != currentName &&
+        _activeRoom != null) {
+      NotificationService.showMessage(
+        roomName: _activeRoom!.name,
+        sender: message.sender,
+        text: message.hasFile ? '发送了文件：${message.fileName}' : message.text,
+      );
+    }
+    _scrollMessagesToBottom();
+  }
+
+  void _scrollMessagesToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_messagesScrollController.hasClients) {
+        return;
+      }
+      _messagesScrollController.animateTo(
+        _messagesScrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOutCubic,
+      );
+    });
   }
 
   void _scan() {
@@ -103,10 +151,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
           relay: _relayEnabled,
         );
         _error = null;
-        _messages.add(
-          ChatMessage(sender: '系统', text: '聊天室已创建，你是房主。', system: true),
-        );
       });
+      _appendMessage(
+        ChatMessage(sender: '系统', text: '聊天室已创建，你是房主。', system: true),
+      );
     } catch (e) {
       setState(() => _error = '创建失败：$e');
     }
@@ -122,10 +170,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
       setState(() {
         _activeRoom = room;
         _error = null;
-        _messages.add(
-          ChatMessage(sender: '系统', text: '已连接到 ${room.name}。', system: true),
-        );
       });
+      _appendMessage(
+        ChatMessage(sender: '系统', text: '已连接到 ${room.name}。', system: true),
+      );
     } catch (e) {
       setState(() => _error = '连接失败：$e');
     }
@@ -138,12 +186,30 @@ class _ChatHomePageState extends State<ChatHomePage> {
     await _network.send(text, sender: _nameController.text.trim());
   }
 
+  Future<void> _sendFile() async {
+    if (_activeRoom == null) {
+      return;
+    }
+    final result = await FilePicker.pickFiles(withData: true);
+    final file = result?.files.single;
+    final bytes = file?.bytes;
+    if (file == null || bytes == null) {
+      return;
+    }
+    await _network.sendFile(
+      sender: _nameController.text.trim(),
+      fileName: file.name,
+      fileSize: bytes.length,
+      base64Data: base64Encode(bytes),
+    );
+  }
+
   Future<void> _leave() async {
     await _network.leaveRoom();
     setState(() {
       _activeRoom = null;
-      _messages.add(ChatMessage(sender: '系统', text: '已离开聊天室。', system: true));
     });
+    _appendMessage(ChatMessage(sender: '系统', text: '已离开聊天室。', system: true));
   }
 
   void _showCreateDialog() {
@@ -439,11 +505,13 @@ class _ChatHomePageState extends State<ChatHomePage> {
         child: _messages.isEmpty
             ? const SizedBox()
             : ListView.builder(
+                controller: _messagesScrollController,
                 padding: const EdgeInsets.all(24),
                 itemCount: _messages.length,
                 itemBuilder: (_, i) => _messageBubble(_messages[i]),
               ),
       ),
+      if (_transfers.isNotEmpty) _buildTransferPanel(),
       Container(
         padding: const EdgeInsets.fromLTRB(18, 10, 18, 16),
         color: Colors.white,
@@ -472,6 +540,11 @@ class _ChatHomePageState extends State<ChatHomePage> {
               ),
             ),
             const SizedBox(width: 10),
+            IconButton(
+              tooltip: '发送文件',
+              onPressed: _activeRoom == null ? null : _sendFile,
+              icon: const Icon(Icons.attach_file),
+            ),
             IconButton.filled(
               tooltip: '发送',
               onPressed: _activeRoom == null ? null : _send,
@@ -482,6 +555,63 @@ class _ChatHomePageState extends State<ChatHomePage> {
       ),
     ],
   );
+
+  Widget _buildTransferPanel() {
+    final active = _transfers.values.toList()
+      ..sort((a, b) => a.done == b.done ? 0 : (a.done ? 1 : -1));
+    return Container(
+      color: const Color(0xffeef4f1),
+      padding: const EdgeInsets.fromLTRB(18, 10, 18, 10),
+      child: Column(
+        children: active.map((status) {
+          final progress = status.progress.clamp(0.0, 1.0);
+          final label = status.incoming ? '接收' : '发送';
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Row(
+              children: [
+                Icon(
+                  status.incoming
+                      ? Icons.file_download_outlined
+                      : Icons.file_upload_outlined,
+                  size: 18,
+                  color: const Color(0xff176b5b),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '$label ${status.fileName}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      LinearProgressIndicator(
+                        value: status.done ? 1 : progress,
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  status.done
+                      ? '完成'
+                      : '${(progress * 100).toStringAsFixed(0)}%',
+                  style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                ),
+              ],
+            ),
+          );
+        }).toList(),
+      ),
+    );
+  }
 
   Widget _messageBubble(ChatMessage message) {
     if (message.system) {
@@ -519,10 +649,93 @@ class _ChatHomePageState extends State<ChatHomePage> {
               ),
             ),
             const SizedBox(height: 3),
-            Text(message.text),
+            if (message.hasFile) _fileTile(message) else Text(message.text),
           ],
         ),
       ),
     );
+  }
+
+  Widget _fileTile(ChatMessage message) {
+    final size = _formatBytes(message.fileSize ?? 0);
+    return InkWell(
+      onTap: () => _saveAndOpenFile(message),
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        constraints: const BoxConstraints(minWidth: 220),
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: const Color(0xfff0f4f3),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: const Color(0xffdce6e2)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.insert_drive_file_outlined,
+              color: Color(0xff176b5b),
+            ),
+            const SizedBox(width: 10),
+            Flexible(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    message.fileName ?? '文件',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    '点击保存并打开 · $size',
+                    style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _saveAndOpenFile(ChatMessage message) async {
+    final fileName = message.fileName;
+    final fileData = message.fileData;
+    if (fileName == null || fileData == null) {
+      return;
+    }
+    try {
+      final baseDir =
+          await getDownloadsDirectory() ??
+          await getApplicationDocumentsDirectory();
+      final receivedDir = Directory(
+        '${baseDir.path}${Platform.pathSeparator}FastChat',
+      );
+      if (!await receivedDir.exists()) {
+        await receivedDir.create(recursive: true);
+      }
+      final file = File(
+        '${receivedDir.path}${Platform.pathSeparator}$fileName',
+      );
+      await file.writeAsBytes(base64Decode(fileData));
+      await OpenFile.open(file.path);
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = '保存文件失败：$e');
+      }
+    }
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes < 1024) {
+      return '$bytes B';
+    }
+    if (bytes < 1024 * 1024) {
+      return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    }
+    return '${(bytes / 1024 / 1024).toStringAsFixed(1)} MB';
   }
 }
