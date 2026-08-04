@@ -26,6 +26,20 @@ class InsertNewlineIntent extends Intent {
 
 enum _RoomAction { pin, mute, delete }
 
+class _InAppNotification {
+  const _InAppNotification({
+    required this.id,
+    required this.roomName,
+    required this.sender,
+    required this.text,
+  });
+
+  final int id;
+  final String roomName;
+  final String sender;
+  final String text;
+}
+
 class _RoomPrefs {
   const _RoomPrefs({
     this.pinned = false,
@@ -125,6 +139,9 @@ class _ChatHomePageState extends State<ChatHomePage> {
   Timer? _scanTimer;
   final Map<String, FileTransferStatus> _transfers = {};
   final Map<String, Timer> _transferCleanupTimers = {};
+  final List<_InAppNotification> _inAppNotifications = [];
+  final Map<int, Timer> _inAppNotificationTimers = {};
+  int _nextInAppNotificationId = 1;
 
   @override
   void initState() {
@@ -186,6 +203,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
       timer.cancel();
     }
     _transferCleanupTimers.clear();
+    for (final timer in _inAppNotificationTimers.values) {
+      timer.cancel();
+    }
+    _inAppNotificationTimers.clear();
     _network.dispose();
     _messageController.dispose();
     _roomController.dispose();
@@ -451,13 +472,61 @@ class _ChatHomePageState extends State<ChatHomePage> {
         messageRoom != null &&
         !_globalMuted &&
         _roomPrefs[roomId]?.muted != true) {
-      NotificationService.showMessage(
+      final text = message.hasFile ? '发送了文件：${message.fileName}' : message.text;
+      _showNotification(
         roomName: messageRoom.name,
         sender: message.sender,
-        text: message.hasFile ? '发送了文件：${message.fileName}' : message.text,
+        text: text,
       );
     }
     _scrollMessagesToBottom();
+  }
+
+  void _showNotification({
+    required String roomName,
+    required String sender,
+    required String text,
+  }) {
+    if (Compatibility.canUseSystemNotifications) {
+      NotificationService.showMessage(
+        roomName: roomName,
+        sender: sender,
+        text: text,
+      );
+      return;
+    }
+    _showInAppNotification(roomName: roomName, sender: sender, text: text);
+  }
+
+  void _showInAppNotification({
+    required String roomName,
+    required String sender,
+    required String text,
+  }) {
+    final id = _nextInAppNotificationId++;
+    setState(() {
+      _inAppNotifications
+        ..add(
+          _InAppNotification(
+            id: id,
+            roomName: roomName,
+            sender: sender,
+            text: text,
+          ),
+        )
+        ..removeRange(0, (_inAppNotifications.length - 2).clamp(0, 99));
+    });
+    _inAppNotificationTimers[id] = Timer(const Duration(seconds: 5), () {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _inAppNotifications.removeWhere(
+          (notification) => notification.id == id,
+        );
+      });
+      _inAppNotificationTimers.remove(id);
+    });
   }
 
   void _scrollMessagesToBottom() {
@@ -911,43 +980,151 @@ class _ChatHomePageState extends State<ChatHomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       body: SafeArea(
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            final compact = constraints.maxWidth < 800;
-            final compactRoomHeight = (constraints.maxHeight * 0.36).clamp(
-              220.0,
-              320.0,
-            );
-            return Column(
-              children: [
-                _buildHeader(compact: compact),
-                Expanded(
-                  child: compact
-                      ? Column(
-                          children: [
-                            SizedBox(
-                              height: compactRoomHeight,
-                              child: _buildRoomPanel(compact: compact),
+        child: Stack(
+          children: [
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final compact = constraints.maxWidth < 800;
+                final compactRoomHeight = (constraints.maxHeight * 0.36).clamp(
+                  220.0,
+                  320.0,
+                );
+                return Column(
+                  children: [
+                    _buildHeader(compact: compact),
+                    Expanded(
+                      child: compact
+                          ? Column(
+                              children: [
+                                SizedBox(
+                                  height: compactRoomHeight,
+                                  child: _buildRoomPanel(compact: compact),
+                                ),
+                                Expanded(child: _buildChatPanel()),
+                              ],
+                            )
+                          : Row(
+                              children: [
+                                SizedBox(
+                                  width: 330,
+                                  child: _buildRoomPanel(compact: compact),
+                                ),
+                                Expanded(child: _buildChatPanel()),
+                              ],
                             ),
-                            Expanded(child: _buildChatPanel()),
-                          ],
-                        )
-                      : Row(
-                          children: [
-                            SizedBox(
-                              width: 330,
-                              child: _buildRoomPanel(compact: compact),
-                            ),
-                            Expanded(child: _buildChatPanel()),
-                          ],
-                        ),
-                ),
-              ],
-            );
-          },
+                    ),
+                  ],
+                );
+              },
+            ),
+            _buildInAppNotificationHost(),
+          ],
         ),
       ),
     );
+  }
+
+  Widget _buildInAppNotificationHost() {
+    final notifications = _inAppNotifications
+        .map(
+          (notification) => TweenAnimationBuilder<double>(
+            key: ValueKey(notification.id),
+            tween: Tween(begin: 0, end: 1),
+            duration: const Duration(milliseconds: 180),
+            curve: Curves.easeOutCubic,
+            builder: (context, value, child) {
+              return Opacity(
+                opacity: value,
+                child: Transform.translate(
+                  offset: Offset(0, (1 - value) * -10),
+                  child: child,
+                ),
+              );
+            },
+            child: _inAppNotificationCard(notification),
+          ),
+        )
+        .toList();
+    return Positioned(
+      top: 88,
+      right: 18,
+      child: IgnorePointer(
+        ignoring: _inAppNotifications.isEmpty,
+        child: SizedBox(
+          width: 320,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: notifications,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _inAppNotificationCard(_InAppNotification notification) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Material(
+        elevation: 8,
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(14, 12, 10, 12),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: const Color(0xffd7e4df)),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Icon(
+                Icons.notifications_active_outlined,
+                color: Color(0xff176b5b),
+                size: 20,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      '${notification.sender} · ${notification.roomName}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      notification.text,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.grey.shade700,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              IconButton(
+                tooltip: '关闭通知',
+                visualDensity: VisualDensity.compact,
+                onPressed: () => _dismissInAppNotification(notification.id),
+                icon: const Icon(Icons.close, size: 18),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _dismissInAppNotification(int id) {
+    _inAppNotificationTimers.remove(id)?.cancel();
+    setState(() {
+      _inAppNotifications.removeWhere((notification) => notification.id == id);
+    });
   }
 
   Widget _buildHeader({required bool compact}) => Container(
