@@ -72,11 +72,14 @@ void FlutterWindow::SetNotificationTopMost(bool enabled) {
     if (::IsIconic(hwnd)) {
       ::ShowWindow(hwnd, SW_RESTORE);
     } else {
-      ::ShowWindow(hwnd, SW_SHOWNORMAL);
+      ::ShowWindow(hwnd, SW_SHOW);
     }
     ::SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    ::BringWindowToTop(hwnd);
     ::SetForegroundWindow(hwnd);
+    ::SetActiveWindow(hwnd);
+    ::UpdateWindow(hwnd);
     return;
   }
 

@@ -21,6 +21,9 @@ class ChatMessage {
     required this.text,
     this.system = false,
     this.roomId,
+    this.senderSignature,
+    this.senderBirthday,
+    this.senderAvatarData,
     this.fileName,
     this.fileSize,
     this.fileData,
@@ -28,6 +31,9 @@ class ChatMessage {
   final String sender, text;
   final bool system;
   final String? roomId;
+  final String? senderSignature;
+  final String? senderBirthday;
+  final String? senderAvatarData;
   final String? fileName;
   final int? fileSize;
   final String? fileData;
@@ -87,6 +93,12 @@ class ChatNetworkService {
   Future<void> send(String text, {required String sender}) async {
     throw UnsupportedError('网页端不支持 WebSocket P2P 模式。');
   }
+
+  void updateProfile({
+    required String signature,
+    required String birthday,
+    required String avatarData,
+  }) {}
 
   Future<void> sendFile({
     required String sender,

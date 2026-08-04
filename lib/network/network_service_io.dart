@@ -26,6 +26,9 @@ class ChatNetworkService {
   StreamSubscription<RawSocketEvent>? _udpSubscription;
   Timer? _announceTimer;
   String _displayName = '访客';
+  String _signature = '';
+  String _birthday = '';
+  String _avatarData = '';
   String? _activeRoomId;
 
   Stream<List<DiscoveredRoom>> get rooms => _roomController.stream;
@@ -158,6 +161,9 @@ class ChatNetworkService {
       'id':
           '${DateTime.now().microsecondsSinceEpoch}-${Random().nextInt(999999)}',
       'sender': sender.isEmpty ? _displayName : sender,
+      'senderSignature': _signature,
+      'senderBirthday': _birthday,
+      'senderAvatarData': _avatarData,
       'text': text,
       'time': DateTime.now().toIso8601String(),
     };
@@ -168,6 +174,9 @@ class ChatNetworkService {
         sender: packet['sender'] as String,
         text: text,
         roomId: roomId,
+        senderSignature: _signature,
+        senderBirthday: _birthday,
+        senderAvatarData: _avatarData,
       ),
     );
     await _sendPacket(state, encoded);
@@ -204,6 +213,9 @@ class ChatNetworkService {
         sender: displayName,
         text: '发送了文件：$fileName',
         roomId: roomId,
+        senderSignature: _signature,
+        senderBirthday: _birthday,
+        senderAvatarData: _avatarData,
         fileName: fileName,
         fileSize: fileSize,
         fileData: base64Data,
@@ -212,7 +224,7 @@ class ChatNetworkService {
 
     await _sendPacket(
       state,
-      '${jsonEncode({'type': 'file-start', 'id': '$transferId-start', 'transferId': transferId, 'sender': displayName, 'text': '发送了文件：$fileName', 'fileName': fileName, 'fileSize': fileSize, 'chunkSize': _fileChunkSize, 'totalChunks': totalChunks, 'time': DateTime.now().toIso8601String()})}\n',
+      '${jsonEncode({'type': 'file-start', 'id': '$transferId-start', 'transferId': transferId, 'sender': displayName, 'senderSignature': _signature, 'senderBirthday': _birthday, 'senderAvatarData': _avatarData, 'text': '发送了文件：$fileName', 'fileName': fileName, 'fileSize': fileSize, 'chunkSize': _fileChunkSize, 'totalChunks': totalChunks, 'time': DateTime.now().toIso8601String()})}\n',
     );
 
     for (var index = 0; index < totalChunks; index++) {
@@ -241,7 +253,7 @@ class ChatNetworkService {
 
     await _sendPacket(
       state,
-      '${jsonEncode({'type': 'file-end', 'id': '$transferId-end', 'transferId': transferId, 'sender': displayName, 'fileName': fileName, 'fileSize': fileSize, 'totalChunks': totalChunks, 'time': DateTime.now().toIso8601String()})}\n',
+      '${jsonEncode({'type': 'file-end', 'id': '$transferId-end', 'transferId': transferId, 'sender': displayName, 'senderSignature': _signature, 'senderBirthday': _birthday, 'senderAvatarData': _avatarData, 'fileName': fileName, 'fileSize': fileSize, 'totalChunks': totalChunks, 'time': DateTime.now().toIso8601String()})}\n',
     );
     _transferController.add(
       FileTransferStatus(
@@ -260,6 +272,16 @@ class ChatNetworkService {
     if (_rooms.containsKey(roomId)) {
       _activeRoomId = roomId;
     }
+  }
+
+  void updateProfile({
+    required String signature,
+    required String birthday,
+    required String avatarData,
+  }) {
+    _signature = signature;
+    _birthday = birthday;
+    _avatarData = avatarData;
   }
 
   Future<void> closeRoom(String roomId) async {
@@ -331,6 +353,9 @@ class ChatNetworkService {
               sender: packet['sender'] ?? '访客',
               text: packet['text'] ?? '',
               roomId: roomId,
+              senderSignature: packet['senderSignature']?.toString(),
+              senderBirthday: packet['senderBirthday']?.toString(),
+              senderAvatarData: packet['senderAvatarData']?.toString(),
             ),
           );
         } else if (type == 'file-start') {
@@ -338,6 +363,9 @@ class ChatNetworkService {
           if (transferId == null) continue;
           _incomingFiles[transferId] = _IncomingFileTransfer(
             sender: packet['sender'] ?? '访客',
+            senderSignature: packet['senderSignature']?.toString() ?? '',
+            senderBirthday: packet['senderBirthday']?.toString() ?? '',
+            senderAvatarData: packet['senderAvatarData']?.toString() ?? '',
             fileName: packet['fileName'] ?? '文件',
             fileSize: packet['fileSize'] ?? 0,
             totalChunks: packet['totalChunks'] ?? 0,
@@ -361,6 +389,9 @@ class ChatNetworkService {
             transferId,
             () => _IncomingFileTransfer(
               sender: packet['sender'] ?? '访客',
+              senderSignature: packet['senderSignature']?.toString() ?? '',
+              senderBirthday: packet['senderBirthday']?.toString() ?? '',
+              senderAvatarData: packet['senderAvatarData']?.toString() ?? '',
               fileName: packet['fileName'] ?? '文件',
               fileSize: packet['fileSize'] ?? 0,
               totalChunks: packet['totalChunks'] ?? 0,
@@ -390,6 +421,9 @@ class ChatNetworkService {
               sender: transfer.sender,
               text: '发送了文件：${transfer.fileName}',
               roomId: roomId,
+              senderSignature: transfer.senderSignature,
+              senderBirthday: transfer.senderBirthday,
+              senderAvatarData: transfer.senderAvatarData,
               fileName: transfer.fileName,
               fileSize: transfer.fileSize,
               fileData: base64Encode(bytes),
@@ -596,12 +630,18 @@ class _RoomState {
 class _IncomingFileTransfer {
   _IncomingFileTransfer({
     required this.sender,
+    required this.senderSignature,
+    required this.senderBirthday,
+    required this.senderAvatarData,
     required this.fileName,
     required this.fileSize,
     required this.totalChunks,
   });
 
   final String sender;
+  final String senderSignature;
+  final String senderBirthday;
+  final String senderAvatarData;
   final String fileName;
   final int fileSize;
   final int totalChunks;

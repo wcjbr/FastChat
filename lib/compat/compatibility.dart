@@ -14,5 +14,7 @@ class Compatibility {
 
   static bool get canUseSystemNotifications => !peSafe && !Platform.isWindows;
 
+  static bool get canUseTopMostInAppNotifications => Platform.isWindows;
+
   static bool get canOpenSavedFiles => !peSafe;
 }

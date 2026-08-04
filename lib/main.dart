@@ -5,6 +5,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:open_file/open_file.dart';
+import 'package:pasteboard/pasteboard.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'compat/compatibility.dart';
@@ -30,7 +31,7 @@ class NativeWindow {
   static const _channel = MethodChannel('fast_chat/window');
 
   static Future<void> setNotificationTopMost(bool enabled) async {
-    if (!Compatibility.peSafe) {
+    if (!Compatibility.canUseTopMostInAppNotifications) {
       return;
     }
     try {
@@ -115,6 +116,9 @@ class ChatHomePage extends StatefulWidget {
 
 class _ChatHomePageState extends State<ChatHomePage> {
   static const _prefDisplayName = 'display_name';
+  static const _prefSignature = 'signature';
+  static const _prefBirthday = 'birthday';
+  static const _prefAvatarData = 'avatar_data';
   static const _prefOobeDone = 'oobe_done';
   static const _prefGlobalMuted = 'global_muted';
   static const _prefSavedRooms = 'saved_rooms';
@@ -126,6 +130,9 @@ class _ChatHomePageState extends State<ChatHomePage> {
   final _messageController = TextEditingController();
   final _roomController = TextEditingController();
   final _nameController = TextEditingController(text: '访客');
+  final _signatureController = TextEditingController();
+  String _birthday = '';
+  String _avatarData = '';
   final _messagesScrollController = ScrollController();
   final Map<String, List<ChatMessage>> _messagesByRoom = {
     _lobbyRoomId: [
@@ -161,6 +168,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
   @override
   void initState() {
     super.initState();
+    HardwareKeyboard.instance.addHandler(_handleHardwareKeyEvent);
     _roomsSub = _network.rooms.listen((rooms) {
       if (mounted) setState(() => _rooms = rooms);
     });
@@ -208,6 +216,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
 
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_handleHardwareKeyEvent);
     _roomsSub?.cancel();
     _hostedRoomsSub?.cancel();
     _joinedRoomsSub?.cancel();
@@ -226,6 +235,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
     _messageController.dispose();
     _roomController.dispose();
     _nameController.dispose();
+    _signatureController.dispose();
     _messagesScrollController.dispose();
     super.dispose();
   }
@@ -233,6 +243,9 @@ class _ChatHomePageState extends State<ChatHomePage> {
   Future<void> _loadPreferences() async {
     final prefs = await SharedPreferences.getInstance();
     final savedName = prefs.getString(_prefDisplayName)?.trim();
+    final signature = prefs.getString(_prefSignature) ?? '';
+    final birthday = prefs.getString(_prefBirthday) ?? '';
+    final avatarData = prefs.getString(_prefAvatarData) ?? '';
     final globalMuted = prefs.getBool(_prefGlobalMuted) ?? false;
     final savedRooms = _decodeJsonList(prefs.getString(_prefSavedRooms));
     final roomPrefs = _decodeJsonMap(prefs.getString(_prefRoomPrefs));
@@ -244,6 +257,14 @@ class _ChatHomePageState extends State<ChatHomePage> {
       if (savedName != null && savedName.isNotEmpty) {
         _nameController.text = savedName;
       }
+      _signatureController.text = signature;
+      _birthday = birthday;
+      _avatarData = avatarData;
+      _network.updateProfile(
+        signature: signature,
+        birthday: birthday,
+        avatarData: avatarData,
+      );
       _globalMuted = globalMuted;
       _savedJoinedRooms
         ..clear()
@@ -344,6 +365,9 @@ class _ChatHomePageState extends State<ChatHomePage> {
     'text': message.text,
     'system': message.system,
     'roomId': message.roomId,
+    'senderSignature': message.senderSignature,
+    'senderBirthday': message.senderBirthday,
+    'senderAvatarData': message.senderAvatarData,
     'fileName': message.fileName,
     'fileSize': message.fileSize,
   };
@@ -353,6 +377,9 @@ class _ChatHomePageState extends State<ChatHomePage> {
     text: json['text']?.toString() ?? '',
     system: json['system'] == true,
     roomId: json['roomId']?.toString(),
+    senderSignature: json['senderSignature']?.toString(),
+    senderBirthday: json['senderBirthday']?.toString(),
+    senderAvatarData: json['senderAvatarData']?.toString(),
     fileName: json['fileName']?.toString(),
     fileSize: json['fileSize'] is int
         ? json['fileSize'] as int
@@ -736,6 +763,77 @@ class _ChatHomePageState extends State<ChatHomePage> {
     await _saveMessagesForRoom(roomId);
   }
 
+  bool _handleHardwareKeyEvent(KeyEvent event) {
+    if (event is! KeyDownEvent || _activeRoom == null) {
+      return false;
+    }
+    final isPasteShortcut =
+        event.logicalKey == LogicalKeyboardKey.keyV &&
+        (HardwareKeyboard.instance.isControlPressed ||
+            HardwareKeyboard.instance.isMetaPressed);
+    if (!isPasteShortcut) {
+      return false;
+    }
+    unawaited(_pasteClipboardAttachments());
+    return true;
+  }
+
+  Future<void> _pasteClipboardAttachments() async {
+    final roomId = _activeRoom?.id;
+    if (roomId == null) {
+      return;
+    }
+    try {
+      final files = await Pasteboard.files();
+      if (files.isNotEmpty) {
+        var sent = false;
+        for (final path in files) {
+          final file = File(path);
+          if (!await file.exists()) {
+            continue;
+          }
+          final bytes = await file.readAsBytes();
+          await _network.sendFile(
+            sender: _nameController.text.trim(),
+            fileName: _baseName(path),
+            fileSize: bytes.length,
+            base64Data: base64Encode(bytes),
+          );
+          sent = true;
+        }
+        if (sent) {
+          await Future<void>.delayed(Duration.zero);
+          await _saveMessagesForRoom(roomId);
+          return;
+        }
+      }
+
+      final image = await Pasteboard.image;
+      if (image == null || image.isEmpty) {
+        return;
+      }
+      final fileName =
+          'clipboard-image-${DateTime.now().millisecondsSinceEpoch}.png';
+      await _network.sendFile(
+        sender: _nameController.text.trim(),
+        fileName: fileName,
+        fileSize: image.length,
+        base64Data: base64Encode(image),
+      );
+      await Future<void>.delayed(Duration.zero);
+      await _saveMessagesForRoom(roomId);
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = '粘贴附件失败：$e');
+      }
+    }
+  }
+
+  String _baseName(String path) {
+    final normalized = path.replaceAll('\\', Platform.pathSeparator);
+    return normalized.split(Platform.pathSeparator).last;
+  }
+
   Future<void> _leave() async {
     final room = _activeRoom;
     await _network.leaveRoom();
@@ -946,6 +1044,11 @@ class _ChatHomePageState extends State<ChatHomePage> {
     final settingsNameController = TextEditingController(
       text: _nameController.text,
     );
+    final settingsSignatureController = TextEditingController(
+      text: _signatureController.text,
+    );
+    var birthday = _birthday;
+    var avatarData = _avatarData;
     var muted = _globalMuted;
     showDialog<void>(
       context: context,
@@ -961,6 +1064,74 @@ class _ChatHomePageState extends State<ChatHomePage> {
                 decoration: const InputDecoration(
                   labelText: '用户名',
                   prefixIcon: Icon(Icons.person_outline),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: settingsSignatureController,
+                maxLines: 2,
+                decoration: const InputDecoration(
+                  labelText: '个性签名',
+                  prefixIcon: Icon(Icons.edit_outlined),
+                ),
+              ),
+              const SizedBox(height: 12),
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.cake_outlined),
+                title: const Text('出生日期'),
+                subtitle: Text(birthday.isEmpty ? '未填写' : birthday),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () async {
+                  final initial = _parseBirthday(birthday) ?? DateTime(2000);
+                  final picked = await showDatePicker(
+                    context: context,
+                    initialDate: initial,
+                    firstDate: DateTime(1900),
+                    lastDate: DateTime.now(),
+                  );
+                  if (picked != null) {
+                    setDialogState(() {
+                      birthday =
+                          '${picked.year.toString().padLeft(4, '0')}-${picked.month.toString().padLeft(2, '0')}-${picked.day.toString().padLeft(2, '0')}';
+                    });
+                  }
+                },
+              ),
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: _avatarWidget(
+                  avatarData: avatarData,
+                  name: settingsNameController.text.trim(),
+                  radius: 18,
+                ),
+                title: const Text('头像'),
+                subtitle: Text(avatarData.isEmpty ? '未设置' : '已设置'),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (avatarData.isNotEmpty)
+                      IconButton(
+                        tooltip: '清除头像',
+                        onPressed: () => setDialogState(() => avatarData = ''),
+                        icon: const Icon(Icons.delete_outline),
+                      ),
+                    IconButton(
+                      tooltip: '选择头像',
+                      onPressed: () async {
+                        final result = await FilePicker.pickFiles(
+                          type: FileType.image,
+                        );
+                        final file = result?.files.single;
+                        if (file == null) {
+                          return;
+                        }
+                        final bytes = await file.readAsBytes();
+                        setDialogState(() => avatarData = base64Encode(bytes));
+                      },
+                      icon: const Icon(Icons.image_outlined),
+                    ),
+                  ],
                 ),
               ),
               const SizedBox(height: 12),
@@ -989,11 +1160,25 @@ class _ChatHomePageState extends State<ChatHomePage> {
                   _nameController.text = name;
                   await prefs.setString(_prefDisplayName, name);
                 }
+                final signature = settingsSignatureController.text.trim();
+                _signatureController.text = signature;
+                await prefs.setString(_prefSignature, signature);
+                await prefs.setString(_prefBirthday, birthday);
+                await prefs.setString(_prefAvatarData, avatarData);
                 await prefs.setBool(_prefGlobalMuted, muted);
                 if (!mounted) {
                   return;
                 }
-                setState(() => _globalMuted = muted);
+                setState(() {
+                  _birthday = birthday;
+                  _avatarData = avatarData;
+                  _globalMuted = muted;
+                });
+                _network.updateProfile(
+                  signature: signature,
+                  birthday: birthday,
+                  avatarData: avatarData,
+                );
                 if (navigator.mounted) {
                   navigator.pop();
                 }
@@ -1003,7 +1188,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
           ],
         ),
       ),
-    ).whenComplete(settingsNameController.dispose);
+    ).whenComplete(() {
+      settingsNameController.dispose();
+      settingsSignatureController.dispose();
+    });
   }
 
   @override
@@ -1160,6 +1348,122 @@ class _ChatHomePageState extends State<ChatHomePage> {
     }
   }
 
+  DateTime? _parseBirthday(String value) {
+    if (value.trim().isEmpty) {
+      return null;
+    }
+    try {
+      return DateTime.parse(value);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  int? _ageFromBirthday(String value) {
+    final birthday = _parseBirthday(value);
+    if (birthday == null) {
+      return null;
+    }
+    final now = DateTime.now();
+    var age = now.year - birthday.year;
+    if (now.month < birthday.month ||
+        (now.month == birthday.month && now.day < birthday.day)) {
+      age--;
+    }
+    return age < 0 ? null : age;
+  }
+
+  bool _isBirthdaySoon(String value) {
+    final birthday = _parseBirthday(value);
+    if (birthday == null) {
+      return false;
+    }
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    var nextBirthday = DateTime(now.year, birthday.month, birthday.day);
+    if (nextBirthday.isBefore(today)) {
+      nextBirthday = DateTime(now.year + 1, birthday.month, birthday.day);
+    }
+    final days = nextBirthday.difference(today).inDays;
+    return days >= 0 && days <= 10;
+  }
+
+  String _displaySender(ChatMessage message) {
+    final prefix = _isBirthdaySoon(message.senderBirthday ?? '') ? '🎂 ' : '';
+    return '$prefix${message.sender}';
+  }
+
+  Widget _avatarWidget({
+    required String? avatarData,
+    required String name,
+    required double radius,
+  }) {
+    final data = avatarData == null || avatarData.isEmpty ? null : avatarData;
+    if (data != null) {
+      try {
+        return CircleAvatar(
+          radius: radius,
+          backgroundImage: MemoryImage(base64Decode(data)),
+        );
+      } catch (_) {}
+    }
+    return CircleAvatar(
+      radius: radius,
+      backgroundColor: const Color(0xffcce7df),
+      foregroundColor: const Color(0xff176b5b),
+      child: Text(
+        name.trim().isEmpty ? '?' : name.trim().characters.first,
+        style: const TextStyle(fontWeight: FontWeight.w700),
+      ),
+    );
+  }
+
+  void _showUserInfo(ChatMessage message) {
+    final birthday = message.senderBirthday ?? '';
+    final age = _ageFromBirthday(birthday);
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            _avatarWidget(
+              avatarData: message.senderAvatarData,
+              name: message.sender,
+              radius: 22,
+            ),
+            const SizedBox(width: 12),
+            Expanded(child: Text(_displaySender(message))),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _UserInfoLine(
+              label: '个性签名',
+              value: (message.senderSignature ?? '').isEmpty
+                  ? '未填写'
+                  : message.senderSignature!,
+            ),
+            const SizedBox(height: 10),
+            _UserInfoLine(
+              label: '出生日期',
+              value: birthday.isEmpty ? '未填写' : birthday,
+            ),
+            const SizedBox(height: 10),
+            _UserInfoLine(label: '年龄', value: age == null ? '未知' : '$age 岁'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildHeader({required bool compact}) => Container(
     height: 72,
     padding: const EdgeInsets.symmetric(horizontal: 24),
@@ -1186,14 +1490,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
             valueListenable: _nameController,
             builder: (context, value, _) {
               final name = value.text.trim();
-              return CircleAvatar(
+              return _avatarWidget(
+                avatarData: _avatarData,
+                name: name,
                 radius: 16,
-                backgroundColor: const Color(0xffcce7df),
-                foregroundColor: const Color(0xff176b5b),
-                child: Text(
-                  name.isEmpty ? '?' : name.characters.first,
-                  style: const TextStyle(fontWeight: FontWeight.w700),
-                ),
               );
             },
           ),
@@ -1667,15 +1967,32 @@ class _ChatHomePageState extends State<ChatHomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              message.sender,
-              style: const TextStyle(
-                fontSize: 11,
-                fontWeight: FontWeight.w700,
-                color: Color(0xff176b5b),
+            InkWell(
+              onTap: () => _showUserInfo(message),
+              borderRadius: BorderRadius.circular(8),
+              child: Padding(
+                padding: const EdgeInsets.only(bottom: 3),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _avatarWidget(
+                      avatarData: message.senderAvatarData,
+                      name: message.sender,
+                      radius: 12,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      _displaySender(message),
+                      style: const TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xff176b5b),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
-            const SizedBox(height: 3),
             if (message.hasFile)
               _fileTile(message)
             else
@@ -1688,6 +2005,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
 
   Widget _fileTile(ChatMessage message) {
     final size = _formatBytes(message.fileSize ?? 0);
+    final isImage = _isImageFile(message.fileName);
     return InkWell(
       onTap: () => _saveAndOpenFile(message),
       borderRadius: BorderRadius.circular(8),
@@ -1699,37 +2017,77 @@ class _ChatHomePageState extends State<ChatHomePage> {
           borderRadius: BorderRadius.circular(8),
           border: Border.all(color: const Color(0xffdce6e2)),
         ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(
-              Icons.insert_drive_file_outlined,
-              color: Color(0xff176b5b),
-            ),
-            const SizedBox(width: 10),
-            Flexible(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+        child: isImage
+            ? _imageTileContent(message, size)
+            : Row(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text(
-                    message.fileName ?? '文件',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  const Icon(
+                    Icons.insert_drive_file_outlined,
+                    color: Color(0xff176b5b),
                   ),
-                  const SizedBox(height: 2),
-                  Text(
-                    Compatibility.canOpenSavedFiles
-                        ? '点击保存并打开 · $size'
-                        : '点击保存 · $size',
-                    style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                  const SizedBox(width: 10),
+                  Flexible(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          message.fileName ?? '文件',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          Compatibility.canOpenSavedFiles
+                              ? '点击保存并打开 · $size'
+                              : '点击保存 · $size',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: Colors.grey.shade600,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ],
               ),
-            ),
-          ],
-        ),
       ),
+    );
+  }
+
+  bool _isImageFile(String? fileName) {
+    final lower = (fileName ?? '').toLowerCase();
+    return lower.endsWith('.png') ||
+        lower.endsWith('.jpg') ||
+        lower.endsWith('.jpeg') ||
+        lower.endsWith('.gif') ||
+        lower.endsWith('.webp') ||
+        lower.endsWith('.bmp');
+  }
+
+  Widget _imageTileContent(ChatMessage message, String size) {
+    final bytes = base64Decode(message.fileData ?? '');
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: Image.memory(
+            bytes,
+            width: 240,
+            height: 160,
+            fit: BoxFit.cover,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          '${message.fileName ?? '图片'} · $size',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+        ),
+      ],
     );
   }
 
@@ -1794,6 +2152,31 @@ class _OobeTipRow extends StatelessWidget {
             text,
             style: const TextStyle(fontSize: 12, color: Colors.black54),
           ),
+        ),
+      ],
+    );
+  }
+}
+
+class _UserInfoLine extends StatelessWidget {
+  const _UserInfoLine({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+        ),
+        const SizedBox(height: 3),
+        SelectableText(
+          value,
+          style: const TextStyle(fontWeight: FontWeight.w600),
         ),
       ],
     );
