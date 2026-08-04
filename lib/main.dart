@@ -521,7 +521,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
     final id = _nextInAppNotificationId++;
     final expiredIds = <int>[];
     setState(() {
-      _inAppNotifications..add(
+      _inAppNotifications.add(
         _InAppNotification(
           id: id,
           roomName: roomName,
