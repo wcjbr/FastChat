@@ -621,12 +621,12 @@ class _ChatHomePageState extends State<ChatHomePage> {
       return;
     }
     final roomId = _activeRoom!.id;
-    final result = await FilePicker.pickFiles(withData: true);
+    final result = await FilePicker.pickFiles();
     final file = result?.files.single;
-    final bytes = file?.bytes;
-    if (file == null || bytes == null) {
+    if (file == null) {
       return;
     }
+    final bytes = await file.readAsBytes();
     await _network.sendFile(
       sender: _nameController.text.trim(),
       fileName: file.name,
