@@ -24,6 +24,21 @@ class InsertNewlineIntent extends Intent {
   const InsertNewlineIntent();
 }
 
+class NativeWindow {
+  NativeWindow._();
+
+  static const _channel = MethodChannel('fast_chat/window');
+
+  static Future<void> setNotificationTopMost(bool enabled) async {
+    if (!Compatibility.peSafe) {
+      return;
+    }
+    try {
+      await _channel.invokeMethod<void>('setNotificationTopMost', enabled);
+    } catch (_) {}
+  }
+}
+
 enum _RoomAction { pin, mute, delete }
 
 class _InAppNotification {
@@ -504,18 +519,30 @@ class _ChatHomePageState extends State<ChatHomePage> {
     required String text,
   }) {
     final id = _nextInAppNotificationId++;
+    final expiredIds = <int>[];
     setState(() {
-      _inAppNotifications
-        ..add(
-          _InAppNotification(
-            id: id,
-            roomName: roomName,
-            sender: sender,
-            text: text,
-          ),
-        )
-        ..removeRange(0, (_inAppNotifications.length - 2).clamp(0, 99));
+      _inAppNotifications..add(
+        _InAppNotification(
+          id: id,
+          roomName: roomName,
+          sender: sender,
+          text: text,
+        ),
+      );
+      final overflow = (_inAppNotifications.length - 3).clamp(0, 99);
+      if (overflow > 0) {
+        expiredIds.addAll(
+          _inAppNotifications
+              .take(overflow)
+              .map((notification) => notification.id),
+        );
+        _inAppNotifications.removeRange(0, overflow);
+      }
     });
+    for (final expiredId in expiredIds) {
+      _inAppNotificationTimers.remove(expiredId)?.cancel();
+    }
+    unawaited(NativeWindow.setNotificationTopMost(true));
     _inAppNotificationTimers[id] = Timer(const Duration(seconds: 5), () {
       if (!mounted) {
         return;
@@ -526,6 +553,9 @@ class _ChatHomePageState extends State<ChatHomePage> {
         );
       });
       _inAppNotificationTimers.remove(id);
+      if (_inAppNotifications.isEmpty) {
+        unawaited(NativeWindow.setNotificationTopMost(false));
+      }
     });
   }
 
@@ -1125,6 +1155,9 @@ class _ChatHomePageState extends State<ChatHomePage> {
     setState(() {
       _inAppNotifications.removeWhere((notification) => notification.id == id);
     });
+    if (_inAppNotifications.isEmpty) {
+      unawaited(NativeWindow.setNotificationTopMost(false));
+    }
   }
 
   Widget _buildHeader({required bool compact}) => Container(
