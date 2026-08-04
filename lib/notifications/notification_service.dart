@@ -1,4 +1,5 @@
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import '../compat/compatibility.dart';
 
 class NotificationService {
   NotificationService._();
@@ -9,6 +10,9 @@ class NotificationService {
   static int _nextId = 1;
 
   static Future<void> initialize() async {
+    if (!Compatibility.canUseSystemNotifications) {
+      return;
+    }
     if (_initialized) {
       return;
     }
@@ -53,6 +57,9 @@ class NotificationService {
     required String sender,
     required String text,
   }) async {
+    if (!Compatibility.canUseSystemNotifications) {
+      return;
+    }
     if (!_initialized) {
       await initialize();
     }

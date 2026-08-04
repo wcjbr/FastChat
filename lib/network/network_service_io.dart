@@ -3,35 +3,36 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
+
 import 'network_service_stub.dart';
 
 class ChatNetworkService {
   static const _discoveryPort = 45454;
   static const int _fileChunkSize = 48 * 1024;
+
   final _roomController = StreamController<List<DiscoveredRoom>>.broadcast();
+  final _hostedRoomController =
+      StreamController<List<DiscoveredRoom>>.broadcast();
   final _messageController = StreamController<ChatMessage>.broadcast();
   final _transferController = StreamController<FileTransferStatus>.broadcast();
-  final _found = <String, DiscoveredRoom>{};
+  final _discovered = <String, DiscoveredRoom>{};
   final _seenMessages = <String>{};
   final _incomingFiles = <String, _IncomingFileTransfer>{};
-  final _clients = <WebSocket>[];
+  final _rooms = <String, _RoomState>{};
+
   RawDatagramSocket? _udp;
   StreamSubscription<RawSocketEvent>? _udpSubscription;
-  HttpServer? _server;
-  WebSocket? _socket;
   Timer? _announceTimer;
-  String _roomId = '';
-  String _roomName = '';
   String _displayName = '访客';
-  bool _hosting = false;
-  bool _relay = true;
-  bool _relayNode = false;
+  String? _activeRoomId;
 
   Stream<List<DiscoveredRoom>> get rooms => _roomController.stream;
+  Stream<List<DiscoveredRoom>> get hostedRooms => _hostedRoomController.stream;
   Stream<ChatMessage> get messages => _messageController.stream;
   Stream<FileTransferStatus> get transfers => _transferController.stream;
-  String get roomId => _roomId;
-  int get port => _server?.port ?? 0;
+  String get roomId => _activeRoomId ?? '';
+  int get port => _rooms[_activeRoomId]?.port ?? 0;
+  DiscoveredRoom? get activeRoom => _rooms[_activeRoomId]?.room;
 
   Future<void> startDiscovery() async {
     _udp ??= await RawDatagramSocket.bind(
@@ -48,59 +49,265 @@ class ChatNetworkService {
       try {
         final json =
             jsonDecode(utf8.decode(packet.data)) as Map<String, dynamic>;
-        if (json['type'] != 'fast-chat-room' || json['id'] == _roomId) return;
+        final id = json['id']?.toString();
+        if (json['type'] != 'fast-chat-room' ||
+            id == null ||
+            _rooms.containsKey(id)) {
+          return;
+        }
         final room = DiscoveredRoom(
-          id: json['id'],
-          name: json['name'],
-          host: json['host'],
+          id: id,
+          name: json['name'] ?? '房间',
+          host: json['host'] ?? '未知',
           address: packet.address.address,
           port: json['wsPort'] ?? json['port'],
           peers: json['peers'] ?? 1,
           relay: json['relay'] ?? true,
         );
-        _found[room.id] = room;
-        _roomController.add(_found.values.toList());
+        _discovered[room.id] = room;
+        _emitDiscoveredRooms();
       } catch (_) {}
     });
   }
 
-  Future<void> hostRoom({required String name, required bool relay}) async {
+  Future<DiscoveredRoom> hostRoom({
+    required String name,
+    required bool relay,
+  }) async {
     await startDiscovery();
-    await leaveRoom();
-    _roomId =
+    final roomId =
         '${DateTime.now().millisecondsSinceEpoch}-${Random().nextInt(9999)}';
-    _roomName = name;
-    _hosting = true;
-    _relayNode = false;
-    _relay = relay;
-    _server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
-    _server!.listen((request) async {
+    final server = await _bindServer(roomId);
+    final room = DiscoveredRoom(
+      id: roomId,
+      name: name,
+      host: '本机房主',
+      address: '127.0.0.1',
+      port: server.port,
+      peers: 1,
+      relay: relay,
+    );
+    _rooms[roomId] = _RoomState(
+      room: room,
+      server: server,
+      relay: relay,
+      relayNode: false,
+    );
+    _activeRoomId = roomId;
+    _emitHostedRooms();
+    _ensureAnnouncing();
+    return room;
+  }
+
+  Future<void> joinRoom(
+    DiscoveredRoom room, {
+    required String displayName,
+    required bool relay,
+  }) async {
+    await startDiscovery();
+    _displayName = displayName.isEmpty ? '访客' : displayName;
+    final activeState = _rooms[_activeRoomId];
+    if (activeState != null && activeState.server == null) {
+      await leaveRoom();
+    }
+    if (_rooms.containsKey(room.id)) {
+      await _closeRoom(room.id);
+    }
+    final upstream = await WebSocket.connect(
+      'ws://${room.address}:${room.port}',
+    );
+    upstream.pingInterval = const Duration(seconds: 20);
+    final state = _RoomState(
+      room: room,
+      upstream: upstream,
+      relay: relay,
+      relayNode: relay,
+    );
+    _rooms[room.id] = state;
+    _activeRoomId = room.id;
+    upstream.listen(
+      (data) => _handleData(room.id, upstream, data.toString()),
+      onDone: () => _onUpstreamClosed(room.id),
+      onError: (_) => _onUpstreamClosed(room.id),
+    );
+    if (relay) {
+      final server = await _bindServer(room.id);
+      state.server = server;
+      state.room = DiscoveredRoom(
+        id: room.id,
+        name: room.name,
+        host: '中继节点',
+        address: room.address,
+        port: server.port,
+        peers: state.peerCount,
+        relay: true,
+      );
+      _emitHostedRooms();
+      _ensureAnnouncing();
+    }
+  }
+
+  Future<void> send(String text, {required String sender}) async {
+    final roomId = _activeRoomId;
+    final state = roomId == null ? null : _rooms[roomId];
+    if (state == null) return;
+
+    final packet = {
+      'type': 'message',
+      'id':
+          '${DateTime.now().microsecondsSinceEpoch}-${Random().nextInt(999999)}',
+      'sender': sender.isEmpty ? _displayName : sender,
+      'text': text,
+      'time': DateTime.now().toIso8601String(),
+    };
+    final encoded = '${jsonEncode(packet)}\n';
+    _seenMessages.add(packet['id'] as String);
+    _messageController.add(
+      ChatMessage(sender: packet['sender'] as String, text: text),
+    );
+    await _sendPacket(state, encoded);
+  }
+
+  Future<void> sendFile({
+    required String sender,
+    required String fileName,
+    required int fileSize,
+    required String base64Data,
+  }) async {
+    final roomId = _activeRoomId;
+    final state = roomId == null ? null : _rooms[roomId];
+    if (state == null) return;
+
+    final bytes = base64Decode(base64Data);
+    final transferId =
+        '${DateTime.now().microsecondsSinceEpoch}-${Random().nextInt(999999)}';
+    final totalChunks = (bytes.length / _fileChunkSize).ceil();
+    final displayName = sender.isEmpty ? _displayName : sender;
+    _transferController.add(
+      FileTransferStatus(
+        transferId: transferId,
+        fileName: fileName,
+        sender: displayName,
+        totalBytes: fileSize,
+        transferredBytes: 0,
+        incoming: false,
+        phase: 'sending',
+      ),
+    );
+    _messageController.add(
+      ChatMessage(
+        sender: displayName,
+        text: '发送了文件：$fileName',
+        fileName: fileName,
+        fileSize: fileSize,
+        fileData: base64Data,
+      ),
+    );
+
+    await _sendPacket(
+      state,
+      '${jsonEncode({'type': 'file-start', 'id': '$transferId-start', 'transferId': transferId, 'sender': displayName, 'text': '发送了文件：$fileName', 'fileName': fileName, 'fileSize': fileSize, 'chunkSize': _fileChunkSize, 'totalChunks': totalChunks, 'time': DateTime.now().toIso8601String()})}\n',
+    );
+
+    for (var index = 0; index < totalChunks; index++) {
+      final start = index * _fileChunkSize;
+      final end = min(start + _fileChunkSize, bytes.length);
+      final chunk = bytes.sublist(start, end);
+      await _sendPacket(
+        state,
+        '${jsonEncode({'type': 'file-chunk', 'id': '$transferId-chunk-$index', 'transferId': transferId, 'sender': displayName, 'fileName': fileName, 'fileSize': fileSize, 'totalChunks': totalChunks, 'index': index, 'data': base64Encode(chunk), 'time': DateTime.now().toIso8601String()})}\n',
+      );
+      if (index % 8 == 7) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      _transferController.add(
+        FileTransferStatus(
+          transferId: transferId,
+          fileName: fileName,
+          sender: displayName,
+          totalBytes: fileSize,
+          transferredBytes: min(end, fileSize),
+          incoming: false,
+          phase: 'sending',
+        ),
+      );
+    }
+
+    await _sendPacket(
+      state,
+      '${jsonEncode({'type': 'file-end', 'id': '$transferId-end', 'transferId': transferId, 'sender': displayName, 'fileName': fileName, 'fileSize': fileSize, 'totalChunks': totalChunks, 'time': DateTime.now().toIso8601String()})}\n',
+    );
+    _transferController.add(
+      FileTransferStatus(
+        transferId: transferId,
+        fileName: fileName,
+        sender: displayName,
+        totalBytes: fileSize,
+        transferredBytes: fileSize,
+        incoming: false,
+        phase: 'done',
+      ),
+    );
+  }
+
+  Future<void> activateRoom(String roomId) async {
+    if (_rooms.containsKey(roomId)) {
+      _activeRoomId = roomId;
+    }
+  }
+
+  Future<void> closeRoom(String roomId) async {
+    await _closeRoom(roomId);
+  }
+
+  Future<void> leaveRoom() async {
+    final roomId = _activeRoomId;
+    if (roomId == null) return;
+    await _closeRoom(roomId);
+  }
+
+  Future<void> dispose() async {
+    final roomIds = _rooms.keys.toList();
+    for (final roomId in roomIds) {
+      await _closeRoom(roomId);
+    }
+    _announceTimer?.cancel();
+    await _udpSubscription?.cancel();
+    _udp?.close();
+    await _roomController.close();
+    await _hostedRoomController.close();
+    await _messageController.close();
+    await _transferController.close();
+  }
+
+  Future<HttpServer> _bindServer(String roomId) async {
+    final server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+    server.listen((request) async {
       if (!WebSocketTransformer.isUpgradeRequest(request)) {
         request.response.statusCode = HttpStatus.badRequest;
         await request.response.close();
         return;
       }
       final webSocket = await WebSocketTransformer.upgrade(request);
-      _attachSocket(webSocket);
+      _attachSocket(roomId, webSocket);
     });
-    _announceTimer?.cancel();
-    _announceTimer = Timer.periodic(
-      const Duration(seconds: 2),
-      (_) => _announce(),
-    );
-    _announce();
+    return server;
   }
 
-  void _attachSocket(WebSocket client) {
-    _clients.add(client);
+  void _attachSocket(String roomId, WebSocket client) {
+    client.pingInterval = const Duration(seconds: 20);
+    final state = _rooms[roomId];
+    if (state == null) return;
+    state.clients.add(client);
+    _emitHostedRooms();
     client.listen(
-      (data) => _handleData(client, data.toString()),
-      onDone: () => _clients.remove(client),
-      onError: (_) => _clients.remove(client),
+      (data) => _handleData(roomId, client, data.toString()),
+      onDone: () => _removeClient(roomId, client),
+      onError: (_) => _removeClient(roomId, client),
     );
   }
 
-  void _handleData(WebSocket source, String data) {
+  void _handleData(String roomId, WebSocket source, String data) {
     for (final line in data.split('\n')) {
       if (line.trim().isEmpty) continue;
       try {
@@ -195,15 +402,16 @@ class ChatNetworkService {
             type == 'file-start' ||
             type == 'file-chunk' ||
             type == 'file-end') {
-          if (_relay) {
+          final state = _rooms[roomId];
+          if (state != null && state.relay) {
             final encoded = '${jsonEncode(packet)}\n';
-            for (final client in List<WebSocket>.from(_clients)) {
-              if (client != source) {
-                client.add(encoded);
-              }
+            if (state.upstream != null && source != state.upstream) {
+              _safeAdd(state.upstream, encoded);
             }
-            if (source != _socket) {
-              _socket?.add(encoded);
+            for (final client in List<WebSocket>.from(state.clients)) {
+              if (client != source) {
+                _safeAdd(client, encoded);
+              }
             }
           }
         }
@@ -211,221 +419,158 @@ class ChatNetworkService {
     }
   }
 
-  Future<void> joinRoom(
-    DiscoveredRoom room, {
-    required String displayName,
-    required bool relay,
-  }) async {
-    await startDiscovery();
-    await leaveRoom();
-    _displayName = displayName.isEmpty ? '访客' : displayName;
-    _relay = relay;
-    _socket = await WebSocket.connect('ws://${room.address}:${room.port}');
-    _socket!.listen(
-      (data) => _handleData(_socket!, data.toString()),
-      onDone: () => _socket = null,
-      onError: (_) => _socket = null,
-    );
-    if (_relay) {
-      _hosting = true;
-      _relayNode = true;
-      _roomId = room.id;
-      _roomName = room.name;
-      _server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
-      _server!.listen((request) async {
-        if (!WebSocketTransformer.isUpgradeRequest(request)) {
-          request.response.statusCode = HttpStatus.badRequest;
-          await request.response.close();
-          return;
+  Future<void> _sendPacket(_RoomState state, String encoded) async {
+    _seenMessages.add(_extractId(encoded));
+    if (state.upstream != null) {
+      _safeAdd(state.upstream, encoded);
+    }
+    for (final client in List<WebSocket>.from(state.clients)) {
+      _safeAdd(client, encoded);
+    }
+  }
+
+  String _extractId(String encoded) {
+    try {
+      final packet = jsonDecode(encoded.trim()) as Map<String, dynamic>;
+      return packet['id']?.toString() ?? '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  void _safeAdd(WebSocket? socket, String encoded) {
+    if (!_isOpen(socket)) return;
+    try {
+      socket!.add(encoded);
+    } catch (_) {
+      if (socket == _rooms[_activeRoomId]?.upstream) {
+        final target = socket;
+        if (target != null) {
+          unawaited(target.close());
         }
-        final webSocket = await WebSocketTransformer.upgrade(request);
-        _attachSocket(webSocket);
-      });
-      _announceTimer?.cancel();
-      _announceTimer = Timer.periodic(
-        const Duration(seconds: 2),
-        (_) => _announce(),
-      );
-      _announce();
-    }
-  }
-
-  Future<void> send(String text, {required String sender}) async {
-    final packet = {
-      'type': 'message',
-      'id':
-          '${DateTime.now().microsecondsSinceEpoch}-${Random().nextInt(999999)}',
-      'sender': sender.isEmpty ? _displayName : sender,
-      'text': text,
-      'time': DateTime.now().toIso8601String(),
-    };
-    final encoded = '${jsonEncode(packet)}\n';
-    _seenMessages.add(packet['id'] as String);
-    if (_hosting) {
-      _messageController.add(
-        ChatMessage(sender: packet['sender'] as String, text: text),
-      );
-      for (final client in List<WebSocket>.from(_clients)) {
-        client.add(encoded);
       }
-      _socket?.add(encoded);
-    } else {
-      _socket?.add(encoded);
     }
   }
 
-  Future<void> sendFile({
-    required String sender,
-    required String fileName,
-    required int fileSize,
-    required String base64Data,
-  }) async {
-    final bytes = base64Decode(base64Data);
-    final transferId =
-        '${DateTime.now().microsecondsSinceEpoch}-${Random().nextInt(999999)}';
-    final totalChunks = (bytes.length / _fileChunkSize).ceil();
-    final displayName = sender.isEmpty ? _displayName : sender;
-    _transferController.add(
-      FileTransferStatus(
-        transferId: transferId,
-        fileName: fileName,
-        sender: displayName,
-        totalBytes: fileSize,
-        transferredBytes: 0,
-        incoming: false,
-        phase: 'sending',
-      ),
-    );
-    _messageController.add(
-      ChatMessage(
-        sender: displayName,
-        text: '发送了文件：$fileName',
-        fileName: fileName,
-        fileSize: fileSize,
-        fileData: base64Data,
-      ),
-    );
+  bool _isOpen(WebSocket? socket) => socket?.readyState == WebSocket.open;
 
-    final packet = {
-      'type': 'file-start',
-      'id': '$transferId-start',
-      'transferId': transferId,
-      'sender': displayName,
-      'text': '发送了文件：$fileName',
-      'fileName': fileName,
-      'fileSize': fileSize,
-      'chunkSize': _fileChunkSize,
-      'totalChunks': totalChunks,
-      'time': DateTime.now().toIso8601String(),
-    };
-    await _sendPacket(packet);
-
-    for (var index = 0; index < totalChunks; index++) {
-      final start = index * _fileChunkSize;
-      final end = min(start + _fileChunkSize, bytes.length);
-      final chunk = bytes.sublist(start, end);
-      await _sendPacket({
-        'type': 'file-chunk',
-        'id': '$transferId-chunk-$index',
-        'transferId': transferId,
-        'sender': displayName,
-        'fileName': fileName,
-        'fileSize': fileSize,
-        'totalChunks': totalChunks,
-        'index': index,
-        'data': base64Encode(chunk),
-        'time': DateTime.now().toIso8601String(),
-      });
-      _transferController.add(
-        FileTransferStatus(
-          transferId: transferId,
-          fileName: fileName,
-          sender: displayName,
-          totalBytes: fileSize,
-          transferredBytes: min(end, fileSize),
-          incoming: false,
-          phase: 'sending',
-        ),
-      );
+  Future<void> _closeRoom(String roomId) async {
+    final state = _rooms.remove(roomId);
+    if (state == null) return;
+    if (_activeRoomId == roomId) {
+      _activeRoomId = null;
     }
+    await state.close();
+    _emitHostedRooms();
+    _emitDiscoveredRooms();
+    _stopAnnouncingIfIdle();
+  }
 
-    await _sendPacket({
-      'type': 'file-end',
-      'id': '$transferId-end',
-      'transferId': transferId,
-      'sender': displayName,
-      'fileName': fileName,
-      'fileSize': fileSize,
-      'totalChunks': totalChunks,
-      'time': DateTime.now().toIso8601String(),
-    });
-    _transferController.add(
-      FileTransferStatus(
-        transferId: transferId,
-        fileName: fileName,
-        sender: displayName,
-        totalBytes: fileSize,
-        transferredBytes: fileSize,
-        incoming: false,
-        phase: 'done',
-      ),
+  void _removeClient(String roomId, WebSocket client) {
+    final state = _rooms[roomId];
+    if (state == null) return;
+    state.clients.remove(client);
+    _emitHostedRooms();
+    _announce();
+  }
+
+  Future<void> _onUpstreamClosed(String roomId) async {
+    final state = _rooms[roomId];
+    if (state == null) return;
+    state.upstream = null;
+    if (state.relay) {
+      state.relayNode = false;
+    }
+    if (state.server == null && state.clients.isEmpty) {
+      await _closeRoom(roomId);
+      return;
+    }
+    _emitHostedRooms();
+  }
+
+  void _emitDiscoveredRooms() {
+    _roomController.add(
+      _discovered.values.where((room) => !_rooms.containsKey(room.id)).toList(),
     );
   }
 
-  Future<void> _sendPacket(Map<String, dynamic> packet) async {
-    final encoded = '${jsonEncode(packet)}\n';
-    _seenMessages.add(packet['id'] as String);
-    if (_hosting) {
-      for (final client in List<WebSocket>.from(_clients)) {
-        client.add(encoded);
-      }
-      _socket?.add(encoded);
-    } else {
-      _socket?.add(encoded);
-    }
+  void _emitHostedRooms() {
+    final hosted = _rooms.values
+        .where((room) => room.server != null)
+        .map((room) => room.room)
+        .toList();
+    _hostedRoomController.add(hosted);
   }
 
   void _announce() {
-    if (!_hosting || _udp == null || _server == null) return;
-    final packet = utf8.encode(
-      jsonEncode({
-        'type': 'fast-chat-room',
-        'id': _roomId,
-        'name': _roomName,
-        'host': _relayNode ? '中继节点' : '本机房主',
-        'wsPort': _server!.port,
-        'port': _server!.port,
-        'peers': _clients.length + 1,
-        'relay': _relay,
-      }),
-    );
-    _udp!.send(packet, InternetAddress('255.255.255.255'), _discoveryPort);
-  }
-
-  Future<void> leaveRoom() async {
-    _announceTimer?.cancel();
-    await _socket?.close();
-    _socket = null;
-    for (final client in List<WebSocket>.from(_clients)) {
-      await client.close();
+    if (_udp == null) return;
+    for (final state in _rooms.values) {
+      if (state.server == null) continue;
+      final packet = utf8.encode(
+        jsonEncode({
+          'type': 'fast-chat-room',
+          'id': state.room.id,
+          'name': state.room.name,
+          'host': state.relayNode ? '中继节点' : '本机房主',
+          'wsPort': state.port,
+          'port': state.port,
+          'peers': state.peerCount,
+          'relay': state.room.relay,
+        }),
+      );
+      _udp!.send(packet, InternetAddress('255.255.255.255'), _discoveryPort);
     }
-    _clients.clear();
-    await _server?.close();
-    _server = null;
-    _hosting = false;
-    _relayNode = false;
-    _seenMessages.clear();
-    _roomId = '';
-    _roomName = '';
   }
 
-  Future<void> dispose() async {
-    await leaveRoom();
-    await _udpSubscription?.cancel();
-    _udp?.close();
-    await _roomController.close();
-    await _messageController.close();
-    await _transferController.close();
+  void _ensureAnnouncing() {
+    _announceTimer ??= Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => _announce(),
+    );
+    _announce();
+  }
+
+  void _stopAnnouncingIfIdle() {
+    if (_rooms.values.any((room) => room.server != null)) return;
+    _announceTimer?.cancel();
+    _announceTimer = null;
+  }
+}
+
+class _RoomState {
+  _RoomState({
+    required this.room,
+    this.server,
+    this.upstream,
+    required this.relay,
+    required this.relayNode,
+  });
+
+  DiscoveredRoom room;
+  HttpServer? server;
+  WebSocket? upstream;
+  final List<WebSocket> clients = [];
+  final bool relay;
+  bool relayNode;
+
+  int get port => room.port;
+  int get peerCount => clients.length + (upstream == null ? 1 : 1);
+
+  Future<void> close() async {
+    try {
+      await upstream?.close();
+    } catch (_) {}
+    upstream = null;
+    for (final client in List<WebSocket>.from(clients)) {
+      try {
+        await client.close();
+      } catch (_) {}
+    }
+    clients.clear();
+    try {
+      await server?.close();
+    } catch (_) {}
+    server = null;
   }
 }
 

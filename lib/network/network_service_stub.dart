@@ -60,12 +60,16 @@ class FileTransferStatus {
 
 class ChatNetworkService {
   final rooms = const Stream<List<DiscoveredRoom>>.empty();
+  final hostedRooms = const Stream<List<DiscoveredRoom>>.empty();
   final messages = const Stream<ChatMessage>.empty();
   final transfers = const Stream<FileTransferStatus>.empty();
   String get roomId => '';
   int get port => 0;
   void startDiscovery() {}
-  Future<void> hostRoom({required String name, required bool relay}) async {
+  Future<DiscoveredRoom> hostRoom({
+    required String name,
+    required bool relay,
+  }) async {
     throw UnsupportedError('网页端不支持创建和发现局域网房间，请运行原生客户端。');
   }
 
@@ -89,6 +93,10 @@ class ChatNetworkService {
   }) async {
     throw UnsupportedError('网页端不支持 WebSocket P2P 模式。');
   }
+
+  Future<void> activateRoom(String roomId) async {}
+
+  Future<void> closeRoom(String roomId) async {}
 
   Future<void> leaveRoom() async {}
   void dispose() {}

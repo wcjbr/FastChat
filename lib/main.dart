@@ -5,10 +5,14 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:open_file/open_file.dart';
 import 'package:path_provider/path_provider.dart';
+import 'compat/compatibility.dart';
 import 'network/network_service.dart';
 import 'notifications/notification_service.dart';
 
-void main() => runApp(const FastChatApp());
+void main(List<String> args) {
+  Compatibility.initialize(args);
+  runApp(const FastChatApp());
+}
 
 class FastChatApp extends StatelessWidget {
   const FastChatApp({super.key});
@@ -46,9 +50,11 @@ class _ChatHomePageState extends State<ChatHomePage> {
     ChatMessage(sender: '系统', text: '欢迎使用 Fast Chat，正在扫描局域网聊天室。', system: true),
   ];
   StreamSubscription? _roomsSub;
+  StreamSubscription? _hostedRoomsSub;
   StreamSubscription? _messagesSub;
   StreamSubscription? _transfersSub;
   List<DiscoveredRoom> _rooms = [];
+  List<DiscoveredRoom> _hostedRooms = [];
   DiscoveredRoom? _activeRoom;
   bool _relayEnabled = true;
   bool _scanning = true;
@@ -61,6 +67,9 @@ class _ChatHomePageState extends State<ChatHomePage> {
     super.initState();
     _roomsSub = _network.rooms.listen((rooms) {
       if (mounted) setState(() => _rooms = rooms);
+    });
+    _hostedRoomsSub = _network.hostedRooms.listen((rooms) {
+      if (mounted) setState(() => _hostedRooms = rooms);
     });
     _messagesSub = _network.messages.listen((message) {
       if (mounted) {
@@ -85,6 +94,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
   @override
   void dispose() {
     _roomsSub?.cancel();
+    _hostedRoomsSub?.cancel();
     _messagesSub?.cancel();
     _transfersSub?.cancel();
     _scanTimer?.cancel();
@@ -139,17 +149,9 @@ class _ChatHomePageState extends State<ChatHomePage> {
     final name = _roomController.text.trim();
     if (name.isEmpty) return;
     try {
-      await _network.hostRoom(name: name, relay: _relayEnabled);
+      final room = await _network.hostRoom(name: name, relay: _relayEnabled);
       setState(() {
-        _activeRoom = DiscoveredRoom(
-          id: _network.roomId,
-          name: name,
-          host: '本机',
-          address: '127.0.0.1',
-          port: _network.port,
-          peers: 1,
-          relay: _relayEnabled,
-        );
+        _activeRoom = room;
         _error = null;
       });
       _appendMessage(
@@ -210,6 +212,27 @@ class _ChatHomePageState extends State<ChatHomePage> {
       _activeRoom = null;
     });
     _appendMessage(ChatMessage(sender: '系统', text: '已离开聊天室。', system: true));
+  }
+
+  Future<void> _openHostedRoom(DiscoveredRoom room) async {
+    await _network.activateRoom(room.id);
+    setState(() {
+      _activeRoom = room;
+      _error = null;
+    });
+    _appendMessage(
+      ChatMessage(sender: '系统', text: '已切换到 ${room.name}。', system: true),
+    );
+  }
+
+  Future<void> _closeHostedRoom(DiscoveredRoom room) async {
+    await _network.closeRoom(room.id);
+    if (_activeRoom?.id == room.id) {
+      setState(() => _activeRoom = null);
+    }
+    _appendMessage(
+      ChatMessage(sender: '系统', text: '已关闭房间 ${room.name}。', system: true),
+    );
   }
 
   void _showCreateDialog() {
@@ -356,7 +379,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
         ),
         const SizedBox(height: 4),
         Text(
-          '${_rooms.length} 个房间可加入',
+          '${_hostedRooms.length} 个我创建 · ${_rooms.length} 个可加入',
           style: TextStyle(color: Colors.grey.shade600, fontSize: 13),
         ),
         if (_error != null)
@@ -368,6 +391,38 @@ class _ChatHomePageState extends State<ChatHomePage> {
             ),
           ),
         const SizedBox(height: 14),
+        if (_hostedRooms.isNotEmpty) ...[
+          const Text(
+            '我的房间',
+            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: (_hostedRooms.length * 76.0).clamp(76.0, 180.0),
+            child: ListView.separated(
+              itemCount: _hostedRooms.length,
+              separatorBuilder: (_, _) => const SizedBox(height: 8),
+              itemBuilder: (context, index) {
+                final room = _hostedRooms[index];
+                return _roomTile(
+                  room,
+                  onTap: () => _openHostedRoom(room),
+                  trailing: IconButton(
+                    tooltip: '关闭房间',
+                    onPressed: () => _closeHostedRoom(room),
+                    icon: const Icon(Icons.close, size: 18),
+                  ),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 14),
+          const Text(
+            '发现的房间',
+            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+        ],
         Expanded(
           child: _rooms.isEmpty
               ? const Center(
@@ -382,63 +437,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
                   separatorBuilder: (_, _) => const SizedBox(height: 8),
                   itemBuilder: (context, index) {
                     final room = _rooms[index];
-                    final selected = _activeRoom?.id == room.id;
-                    return InkWell(
-                      onTap: () => _join(room),
-                      borderRadius: BorderRadius.circular(8),
-                      child: Container(
-                        padding: const EdgeInsets.all(13),
-                        decoration: BoxDecoration(
-                          color: selected
-                              ? const Color(0xffd7ebe5)
-                              : Colors.white,
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(
-                            color: selected
-                                ? const Color(0xff75b7a5)
-                                : const Color(0xffe1e9e6),
-                          ),
-                        ),
-                        child: Row(
-                          children: [
-                            CircleAvatar(
-                              backgroundColor: const Color(0xffcce7df),
-                              foregroundColor: const Color(0xff176b5b),
-                              child: Text(room.name.characters.first),
-                            ),
-                            const SizedBox(width: 11),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    room.name,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 3),
-                                  Text(
-                                    '${room.host} · ${room.peers} 人${room.relay ? ' · 中继' : ''}',
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      color: Colors.grey.shade600,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            const Icon(
-                              Icons.chevron_right,
-                              size: 18,
-                              color: Colors.black38,
-                            ),
-                          ],
-                        ),
-                      ),
-                    );
+                    return _roomTile(room, onTap: () => _join(room));
                   },
                 ),
         ),
@@ -456,6 +455,62 @@ class _ChatHomePageState extends State<ChatHomePage> {
       ],
     ),
   );
+
+  Widget _roomTile(
+    DiscoveredRoom room, {
+    required VoidCallback onTap,
+    Widget? trailing,
+  }) {
+    final selected = _activeRoom?.id == room.id;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.all(13),
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xffd7ebe5) : Colors.white,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: selected ? const Color(0xff75b7a5) : const Color(0xffe1e9e6),
+          ),
+        ),
+        child: Row(
+          children: [
+            CircleAvatar(
+              backgroundColor: const Color(0xffcce7df),
+              foregroundColor: const Color(0xff176b5b),
+              child: Text(room.name.characters.first),
+            ),
+            const SizedBox(width: 11),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    room.name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    '${room.host} · ${room.peers} 人${room.relay ? ' · 中继' : ''}',
+                    style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                  ),
+                ],
+              ),
+            ),
+            trailing ??
+                const Icon(
+                  Icons.chevron_right,
+                  size: 18,
+                  color: Colors.black38,
+                ),
+          ],
+        ),
+      ),
+    );
+  }
 
   Widget _buildChatPanel() => Column(
     children: [
@@ -689,7 +744,9 @@ class _ChatHomePageState extends State<ChatHomePage> {
                   ),
                   const SizedBox(height: 2),
                   Text(
-                    '点击保存并打开 · $size',
+                    Compatibility.canOpenSavedFiles
+                        ? '点击保存并打开 · $size'
+                        : '点击保存 · $size',
                     style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
                   ),
                 ],
@@ -721,7 +778,11 @@ class _ChatHomePageState extends State<ChatHomePage> {
         '${receivedDir.path}${Platform.pathSeparator}$fileName',
       );
       await file.writeAsBytes(base64Decode(fileData));
-      await OpenFile.open(file.path);
+      if (Compatibility.canOpenSavedFiles) {
+        try {
+          await OpenFile.open(file.path);
+        } catch (_) {}
+      }
     } catch (e) {
       if (mounted) {
         setState(() => _error = '保存文件失败：$e');
