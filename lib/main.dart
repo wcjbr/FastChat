@@ -131,6 +131,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
   static const _prefAcgoProfile = 'acgo_profile';
   static const _prefAcgoAccessToken = 'acgo_access_token';
   static const _prefAcgoConversationPrefs = 'acgo_conversation_prefs';
+  static const _prefDownloadDirectory = 'download_directory';
   static const _lobbyRoomId = '__lobby__';
 
   final _acgoService = AcgoBindingService();
@@ -142,6 +143,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
   final _signatureController = TextEditingController();
   String _birthday = '';
   String _avatarData = '';
+  String _downloadDirectory = '';
   AcgoProfileSummary? _acgoProfile;
   String _acgoAccessToken = '';
   AcgoPrivateMessageService? _acgoPrivateService;
@@ -267,6 +269,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
     final signature = prefs.getString(_prefSignature) ?? '';
     final birthday = prefs.getString(_prefBirthday) ?? '';
     final avatarData = prefs.getString(_prefAvatarData) ?? '';
+    final downloadDirectory = prefs.getString(_prefDownloadDirectory) ?? '';
     final acgoProfile = AcgoProfileSummary.tryDecode(
       prefs.getString(_prefAcgoProfile),
     );
@@ -288,6 +291,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
       _signatureController.text = signature;
       _birthday = birthday;
       _avatarData = avatarData;
+      _downloadDirectory = downloadDirectory;
       _acgoProfile = acgoProfile;
       _acgoAccessToken = acgoAccessToken;
       _acgoPrivateService = _createAcgoPrivateService(
@@ -1428,150 +1432,195 @@ class _ChatHomePageState extends State<ChatHomePage> {
     var avatarData = _avatarData;
     var muted = _globalMuted;
     var acgoProfile = _acgoProfile;
+    var downloadDirectory = _downloadDirectory;
     showDialog<void>(
       context: context,
       builder: (context) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
           title: const Text('设置'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: settingsNameController,
-                autofocus: true,
-                decoration: const InputDecoration(
-                  labelText: '用户名',
-                  prefixIcon: Icon(Icons.person_outline),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: settingsNameController,
+                  autofocus: true,
+                  decoration: const InputDecoration(
+                    labelText: '用户名',
+                    prefixIcon: Icon(Icons.person_outline),
+                  ),
                 ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: settingsSignatureController,
-                maxLines: 2,
-                decoration: const InputDecoration(
-                  labelText: '个性签名',
-                  prefixIcon: Icon(Icons.edit_outlined),
-                ),
-              ),
-              const SizedBox(height: 12),
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: const Icon(Icons.cake_outlined),
-                title: const Text('出生日期'),
-                subtitle: Text(birthday.isEmpty ? '未填写' : birthday),
-                trailing: const Icon(Icons.chevron_right),
-                onTap: () async {
-                  final initial = _parseBirthday(birthday) ?? DateTime(2000);
-                  final picked = await showDatePicker(
-                    context: context,
-                    initialDate: initial,
-                    firstDate: DateTime(1900),
-                    lastDate: DateTime.now(),
-                  );
-                  if (picked != null) {
-                    setDialogState(() {
-                      birthday =
-                          '${picked.year.toString().padLeft(4, '0')}-${picked.month.toString().padLeft(2, '0')}-${picked.day.toString().padLeft(2, '0')}';
-                    });
-                  }
-                },
-              ),
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: _avatarWidget(
-                  avatarData: avatarData,
-                  name: settingsNameController.text.trim(),
-                  radius: 18,
-                ),
-                title: const Text('头像'),
-                subtitle: Text(avatarData.isEmpty ? '未设置' : '已设置'),
-                trailing: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (avatarData.isNotEmpty)
-                      IconButton(
-                        tooltip: '清除头像',
-                        onPressed: () => setDialogState(() => avatarData = ''),
-                        icon: const Icon(Icons.delete_outline),
-                      ),
-                    IconButton(
-                      tooltip: '选择头像',
-                      onPressed: () async {
-                        final result = await FilePicker.pickFiles(
-                          type: FileType.image,
-                        );
-                        final file = result?.files.single;
-                        if (file == null) {
-                          return;
-                        }
-                        final bytes = await file.readAsBytes();
-                        setDialogState(() => avatarData = base64Encode(bytes));
-                      },
-                      icon: const Icon(Icons.image_outlined),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: const Icon(Icons.link_outlined),
-                title: const Text('ACGO 账号'),
-                subtitle: Text(
-                  acgoProfile == null
-                      ? '未绑定'
-                      : '${acgoProfile!.displayName} · ${acgoProfile!.problemText}',
+                const SizedBox(height: 12),
+                TextField(
+                  controller: settingsSignatureController,
                   maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
+                  decoration: const InputDecoration(
+                    labelText: '个性签名',
+                    prefixIcon: Icon(Icons.edit_outlined),
+                  ),
                 ),
-                trailing: Wrap(
-                  spacing: 4,
-                  children: [
-                    if (acgoProfile != null)
-                      IconButton(
-                        tooltip: '刷新',
-                        onPressed: () async {
-                          final updated = await _refreshAcgoProfile();
-                          if (updated != null) {
-                            setDialogState(() => acgoProfile = updated);
-                          }
-                        },
-                        icon: const Icon(Icons.refresh),
-                      ),
-                    if (acgoProfile != null)
-                      IconButton(
-                        tooltip: '解绑',
-                        onPressed: () async {
-                          await _clearAcgoBinding();
-                          setDialogState(() => acgoProfile = null);
-                        },
-                        icon: const Icon(Icons.link_off_outlined),
-                      )
-                    else
-                      IconButton(
-                        tooltip: '绑定',
-                        onPressed: () async {
-                          final bound = await _showAcgoBindDialog();
-                          if (bound != null) {
-                            setDialogState(() => acgoProfile = bound);
-                          }
-                        },
-                        icon: const Icon(Icons.login),
-                      ),
-                  ],
+                const SizedBox(height: 12),
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.cake_outlined),
+                  title: const Text('出生日期'),
+                  subtitle: Text(birthday.isEmpty ? '未填写' : birthday),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: () async {
+                    final initial = _parseBirthday(birthday) ?? DateTime(2000);
+                    final picked = await showDatePicker(
+                      context: context,
+                      initialDate: initial,
+                      firstDate: DateTime(1900),
+                      lastDate: DateTime.now(),
+                    );
+                    if (picked != null) {
+                      setDialogState(() {
+                        birthday =
+                            '${picked.year.toString().padLeft(4, '0')}-${picked.month.toString().padLeft(2, '0')}-${picked.day.toString().padLeft(2, '0')}';
+                      });
+                    }
+                  },
                 ),
-              ),
-              const SizedBox(height: 12),
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                value: muted,
-                onChanged: (value) {
-                  setDialogState(() => muted = value);
-                },
-                title: const Text('全局免打扰'),
-                subtitle: const Text('开启后不再弹出任何新消息通知'),
-              ),
-            ],
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: _avatarWidget(
+                    avatarData: avatarData,
+                    name: settingsNameController.text.trim(),
+                    radius: 18,
+                  ),
+                  title: const Text('头像'),
+                  subtitle: Text(avatarData.isEmpty ? '未设置' : '已设置'),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (avatarData.isNotEmpty)
+                        IconButton(
+                          tooltip: '清除头像',
+                          onPressed: () =>
+                              setDialogState(() => avatarData = ''),
+                          icon: const Icon(Icons.delete_outline),
+                        ),
+                      IconButton(
+                        tooltip: '选择头像',
+                        onPressed: () async {
+                          final result = await FilePicker.pickFiles(
+                            type: FileType.image,
+                          );
+                          final file = result?.files.single;
+                          if (file == null) {
+                            return;
+                          }
+                          final bytes = await file.readAsBytes();
+                          setDialogState(
+                            () => avatarData = base64Encode(bytes),
+                          );
+                        },
+                        icon: const Icon(Icons.image_outlined),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.folder_outlined),
+                  title: const Text('下载目录'),
+                  subtitle: Text(
+                    downloadDirectory.isEmpty
+                        ? '默认：系统下载目录/FastChat'
+                        : downloadDirectory,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (downloadDirectory.isNotEmpty)
+                        IconButton(
+                          tooltip: '恢复默认',
+                          onPressed: () =>
+                              setDialogState(() => downloadDirectory = ''),
+                          icon: const Icon(Icons.restore),
+                        ),
+                      IconButton(
+                        tooltip: '选择目录',
+                        onPressed: () async {
+                          final selected = await FilePicker.getDirectoryPath(
+                            dialogTitle: '选择下载目录',
+                            initialDirectory: downloadDirectory.isEmpty
+                                ? null
+                                : downloadDirectory,
+                          );
+                          if (selected == null || selected.isEmpty) return;
+                          setDialogState(() => downloadDirectory = selected);
+                        },
+                        icon: const Icon(Icons.drive_folder_upload_outlined),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.link_outlined),
+                  title: const Text('ACGO 账号'),
+                  subtitle: Text(
+                    acgoProfile == null
+                        ? '未绑定'
+                        : '${acgoProfile!.displayName} · ${acgoProfile!.problemText}',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  trailing: Wrap(
+                    spacing: 4,
+                    children: [
+                      if (acgoProfile != null)
+                        IconButton(
+                          tooltip: '刷新',
+                          onPressed: () async {
+                            final updated = await _refreshAcgoProfile();
+                            if (updated != null) {
+                              setDialogState(() => acgoProfile = updated);
+                            }
+                          },
+                          icon: const Icon(Icons.refresh),
+                        ),
+                      if (acgoProfile != null)
+                        IconButton(
+                          tooltip: '解绑',
+                          onPressed: () async {
+                            await _clearAcgoBinding();
+                            setDialogState(() => acgoProfile = null);
+                          },
+                          icon: const Icon(Icons.link_off_outlined),
+                        )
+                      else
+                        IconButton(
+                          tooltip: '绑定',
+                          onPressed: () async {
+                            final bound = await _showAcgoBindDialog();
+                            if (bound != null) {
+                              setDialogState(() => acgoProfile = bound);
+                            }
+                          },
+                          icon: const Icon(Icons.login),
+                        ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: muted,
+                  onChanged: (value) {
+                    setDialogState(() => muted = value);
+                  },
+                  title: const Text('全局免打扰'),
+                  subtitle: const Text('开启后不再弹出任何新消息通知'),
+                ),
+              ],
+            ),
           ),
           actions: [
             TextButton(
@@ -1593,6 +1642,14 @@ class _ChatHomePageState extends State<ChatHomePage> {
                 await prefs.setString(_prefBirthday, birthday);
                 await prefs.setString(_prefAvatarData, avatarData);
                 await prefs.setBool(_prefGlobalMuted, muted);
+                if (downloadDirectory.isEmpty) {
+                  await prefs.remove(_prefDownloadDirectory);
+                } else {
+                  await prefs.setString(
+                    _prefDownloadDirectory,
+                    downloadDirectory,
+                  );
+                }
                 if (acgoProfile == null) {
                   await prefs.remove(_prefAcgoProfile);
                   await prefs.remove(_prefAcgoAccessToken);
@@ -1608,6 +1665,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
                 setState(() {
                   _birthday = birthday;
                   _avatarData = avatarData;
+                  _downloadDirectory = downloadDirectory;
                   _globalMuted = muted;
                   _acgoProfile = acgoProfile;
                 });
@@ -2846,7 +2904,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
                         const SizedBox(height: 2),
                         Text(
                           Compatibility.canOpenSavedFiles
-                              ? '点击保存并打开 · $size'
+                              ? '点击保存并打开文件夹 · $size'
                               : '点击保存 · $size',
                           style: TextStyle(
                             fontSize: 11,
@@ -2893,6 +2951,11 @@ class _ChatHomePageState extends State<ChatHomePage> {
           overflow: TextOverflow.ellipsis,
           style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
         ),
+        const SizedBox(height: 2),
+        Text(
+          Compatibility.canOpenSavedFiles ? '点击保存并打开文件夹' : '点击保存',
+          style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+        ),
       ],
     );
   }
@@ -2904,12 +2967,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
       return;
     }
     try {
-      final baseDir =
-          await getDownloadsDirectory() ??
-          await getApplicationDocumentsDirectory();
-      final receivedDir = Directory(
-        '${baseDir.path}${Platform.pathSeparator}FastChat',
-      );
+      final receivedDir = await _resolvedDownloadDirectory();
       if (!await receivedDir.exists()) {
         await receivedDir.create(recursive: true);
       }
@@ -2918,14 +2976,44 @@ class _ChatHomePageState extends State<ChatHomePage> {
       );
       await file.writeAsBytes(base64Decode(fileData));
       if (Compatibility.canOpenSavedFiles) {
-        try {
-          await OpenFile.open(file.path);
-        } catch (_) {}
+        await _openContainingFolder(file, receivedDir);
       }
     } catch (e) {
       if (mounted) {
         setState(() => _error = '保存文件失败：$e');
       }
+    }
+  }
+
+  Future<Directory> _resolvedDownloadDirectory() async {
+    if (_downloadDirectory.trim().isNotEmpty) {
+      return Directory(_downloadDirectory.trim());
+    }
+    final baseDir =
+        await getDownloadsDirectory() ??
+        await getApplicationDocumentsDirectory();
+    return Directory('${baseDir.path}${Platform.pathSeparator}FastChat');
+  }
+
+  Future<void> _openContainingFolder(File file, Directory directory) async {
+    try {
+      if (Platform.isWindows) {
+        final result = await Process.run('explorer.exe', [
+          '/select,${file.path}',
+        ]);
+        if (result.exitCode == 0) return;
+      } else if (Platform.isMacOS) {
+        final result = await Process.run('open', ['-R', file.path]);
+        if (result.exitCode == 0) return;
+      } else if (Platform.isLinux) {
+        final result = await Process.run('xdg-open', [directory.path]);
+        if (result.exitCode == 0) return;
+      }
+      await OpenFile.open(directory.path);
+    } catch (_) {
+      try {
+        await OpenFile.open(directory.path);
+      } catch (_) {}
     }
   }
 
