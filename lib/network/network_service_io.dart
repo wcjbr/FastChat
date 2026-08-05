@@ -80,13 +80,18 @@ class ChatNetworkService {
   Future<DiscoveredRoom> hostRoom({
     required String name,
     required bool relay,
+    String? roomId,
   }) async {
     await startDiscovery();
-    final roomId =
+    final effectiveRoomId =
+        roomId ??
         '${DateTime.now().millisecondsSinceEpoch}-${Random().nextInt(9999)}';
-    final server = await _bindServer(roomId);
+    if (_rooms.containsKey(effectiveRoomId)) {
+      await _closeRoom(effectiveRoomId);
+    }
+    final server = await _bindServer(effectiveRoomId);
     final room = DiscoveredRoom(
-      id: roomId,
+      id: effectiveRoomId,
       name: name,
       host: '本机房主',
       address: '127.0.0.1',
@@ -94,13 +99,13 @@ class ChatNetworkService {
       peers: 1,
       relay: relay,
     );
-    _rooms[roomId] = _RoomState(
+    _rooms[effectiveRoomId] = _RoomState(
       room: room,
       server: server,
       relay: relay,
       relayNode: false,
     );
-    _activeRoomId = roomId;
+    _activeRoomId = effectiveRoomId;
     _emitHostedRooms();
     _ensureAnnouncing();
     return room;

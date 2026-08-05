@@ -1,14 +1,17 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' as ui;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:open_file/open_file.dart';
 import 'package:pasteboard/pasteboard.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:pointycastle/export.dart' show RSAPublicKey;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'acgo/acgo_binding_service.dart';
+import 'acgo/acgo_e2ee.dart';
 import 'acgo/acgo_private_message_service.dart';
 import 'compat/compatibility.dart';
 import 'network/network_service.dart';
@@ -92,6 +95,113 @@ class _RoomPrefs {
   );
 }
 
+abstract class _AppStorage {
+  Future<String?> getString(String key);
+  Future<bool?> getBool(String key);
+  Future<void> setString(String key, String value);
+  Future<void> setBool(String key, bool value);
+  Future<void> remove(String key);
+}
+
+class _SharedPrefsStorage implements _AppStorage {
+  _SharedPrefsStorage(this._prefs);
+
+  final SharedPreferences _prefs;
+
+  @override
+  Future<String?> getString(String key) async => _prefs.getString(key);
+
+  @override
+  Future<bool?> getBool(String key) async => _prefs.getBool(key);
+
+  @override
+  Future<void> setString(String key, String value) async {
+    await _prefs.setString(key, value);
+  }
+
+  @override
+  Future<void> setBool(String key, bool value) async {
+    await _prefs.setBool(key, value);
+  }
+
+  @override
+  Future<void> remove(String key) async {
+    await _prefs.remove(key);
+  }
+}
+
+class _PortableFileStorage implements _AppStorage {
+  _PortableFileStorage(this.rootDirectory);
+
+  final String rootDirectory;
+  Map<String, dynamic>? _cache;
+
+  Directory get dataDirectory =>
+      Directory('$rootDirectory${Platform.pathSeparator}fastchat');
+
+  File get configFile =>
+      File('${dataDirectory.path}${Platform.pathSeparator}config.json');
+
+  @override
+  Future<String?> getString(String key) async {
+    final data = await _read();
+    final value = data[key];
+    return value is String ? value : null;
+  }
+
+  @override
+  Future<bool?> getBool(String key) async {
+    final data = await _read();
+    final value = data[key];
+    return value is bool ? value : null;
+  }
+
+  @override
+  Future<void> setString(String key, String value) async {
+    final data = await _read();
+    data[key] = value;
+    await _write(data);
+  }
+
+  @override
+  Future<void> setBool(String key, bool value) async {
+    final data = await _read();
+    data[key] = value;
+    await _write(data);
+  }
+
+  @override
+  Future<void> remove(String key) async {
+    final data = await _read();
+    data.remove(key);
+    await _write(data);
+  }
+
+  Future<Map<String, dynamic>> _read() async {
+    final cached = _cache;
+    if (cached != null) return cached;
+    try {
+      if (!await configFile.exists()) {
+        _cache = <String, dynamic>{};
+        return _cache!;
+      }
+      final decoded = jsonDecode(await configFile.readAsString());
+      _cache = decoded is Map ? Map<String, dynamic>.from(decoded) : {};
+      return _cache!;
+    } catch (_) {
+      _cache = <String, dynamic>{};
+      return _cache!;
+    }
+  }
+
+  Future<void> _write(Map<String, dynamic> data) async {
+    if (!await dataDirectory.exists()) {
+      await dataDirectory.create(recursive: true);
+    }
+    await configFile.writeAsString(jsonEncode(data));
+  }
+}
+
 class FastChatApp extends StatelessWidget {
   const FastChatApp({super.key});
 
@@ -132,7 +242,12 @@ class _ChatHomePageState extends State<ChatHomePage> {
   static const _prefAcgoAccessToken = 'acgo_access_token';
   static const _prefAcgoConversationPrefs = 'acgo_conversation_prefs';
   static const _prefDownloadDirectory = 'download_directory';
+  static const _prefAcgoE2eeIdentity = 'acgo_e2ee_identity';
+  static const _prefAcgoPeerKeys = 'acgo_peer_keys';
+  static const _prefPortableMode = 'portable_mode';
+  static const _prefPortableRootDirectory = 'portable_root_directory';
   static const _lobbyRoomId = '__lobby__';
+  static const _messageWindowBatchSize = 80;
 
   final _acgoService = AcgoBindingService();
   final _network = ChatNetworkService();
@@ -144,17 +259,25 @@ class _ChatHomePageState extends State<ChatHomePage> {
   String _birthday = '';
   String _avatarData = '';
   String _downloadDirectory = '';
+  bool _portableMode = false;
+  String _portableRootDirectory = '';
+  _AppStorage? _storage;
   AcgoProfileSummary? _acgoProfile;
   String _acgoAccessToken = '';
   AcgoPrivateMessageService? _acgoPrivateService;
   List<AcgoPrivateConversation> _acgoConversations = [];
   final Map<String, List<ChatMessage>> _acgoMessagesByConversation = {};
   final Map<String, _RoomPrefs> _acgoConversationPrefs = {};
+  final Map<String, RSAPublicKey> _acgoPeerKeys = {};
+  final Set<String> _advertisedAcgoKeyConversations = {};
+  AcgoE2eeIdentity? _acgoE2eeIdentity;
   AcgoPrivateConversation? _activeAcgoConversation;
   bool _loadingAcgoConversations = false;
   bool _loadingAcgoMessages = false;
   bool _sendingAcgoMessage = false;
   final _messagesScrollController = ScrollController();
+  final ValueNotifier<int> _messagesVersion = ValueNotifier<int>(0);
+  final Map<String, int> _messageWindowLimits = {};
   final Map<String, List<ChatMessage>> _messagesByRoom = {
     _lobbyRoomId: [
       ChatMessage(
@@ -180,7 +303,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
   bool _globalMuted = false;
   String? _error;
   Timer? _scanTimer;
+  Timer? _messageSaveTimer;
   final Map<String, FileTransferStatus> _transfers = {};
+  final Map<String, MemoryImage> _avatarImageCache = {};
+  final Map<String, Uint8List> _imageBytesCache = {};
   final Map<String, Timer> _transferCleanupTimers = {};
   final List<_InAppNotification> _inAppNotifications = [];
   final Map<int, Timer> _inAppNotificationTimers = {};
@@ -190,6 +316,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
   void initState() {
     super.initState();
     HardwareKeyboard.instance.addHandler(_handleHardwareKeyEvent);
+    _messagesScrollController.addListener(_maybeLoadOlderMessages);
     _roomsSub = _network.rooms.listen((rooms) {
       if (mounted) setState(() => _rooms = rooms);
     });
@@ -238,12 +365,14 @@ class _ChatHomePageState extends State<ChatHomePage> {
   @override
   void dispose() {
     HardwareKeyboard.instance.removeHandler(_handleHardwareKeyEvent);
+    _messagesScrollController.removeListener(_maybeLoadOlderMessages);
     _roomsSub?.cancel();
     _hostedRoomsSub?.cancel();
     _joinedRoomsSub?.cancel();
     _messagesSub?.cancel();
     _transfersSub?.cancel();
     _scanTimer?.cancel();
+    _messageSaveTimer?.cancel();
     for (final timer in _transferCleanupTimers.values) {
       timer.cancel();
     }
@@ -260,26 +389,54 @@ class _ChatHomePageState extends State<ChatHomePage> {
     _nameController.dispose();
     _signatureController.dispose();
     _messagesScrollController.dispose();
+    _messagesVersion.dispose();
     super.dispose();
   }
 
   Future<void> _loadPreferences() async {
-    final prefs = await SharedPreferences.getInstance();
-    final savedName = prefs.getString(_prefDisplayName)?.trim();
-    final signature = prefs.getString(_prefSignature) ?? '';
-    final birthday = prefs.getString(_prefBirthday) ?? '';
-    final avatarData = prefs.getString(_prefAvatarData) ?? '';
-    final downloadDirectory = prefs.getString(_prefDownloadDirectory) ?? '';
-    final acgoProfile = AcgoProfileSummary.tryDecode(
-      prefs.getString(_prefAcgoProfile),
+    final bootstrapPrefs = await SharedPreferences.getInstance();
+    final portableMode = bootstrapPrefs.getBool(_prefPortableMode) ?? false;
+    final portableRoot =
+        bootstrapPrefs.getString(_prefPortableRootDirectory) ?? '';
+    final storage = _createStorage(
+      bootstrapPrefs,
+      portableMode: portableMode,
+      portableRootDirectory: portableRoot,
     );
-    final acgoAccessToken = prefs.getString(_prefAcgoAccessToken) ?? '';
-    final globalMuted = prefs.getBool(_prefGlobalMuted) ?? false;
-    final savedRooms = _decodeJsonList(prefs.getString(_prefSavedRooms));
-    final roomPrefs = _decodeJsonMap(prefs.getString(_prefRoomPrefs));
-    final roomMessages = _decodeJsonMap(prefs.getString(_prefRoomMessages));
+    _storage = storage;
+    final savedName = (await storage.getString(_prefDisplayName))?.trim();
+    final signature = await storage.getString(_prefSignature) ?? '';
+    final birthday = await storage.getString(_prefBirthday) ?? '';
+    final avatarData = await storage.getString(_prefAvatarData) ?? '';
+    final downloadDirectory =
+        await storage.getString(_prefDownloadDirectory) ?? '';
+    final acgoProfile = AcgoProfileSummary.tryDecode(
+      await storage.getString(_prefAcgoProfile),
+    );
+    final acgoAccessToken = await storage.getString(_prefAcgoAccessToken) ?? '';
+    final globalMuted = await storage.getBool(_prefGlobalMuted) ?? false;
+    final savedRooms = _decodeJsonList(
+      await storage.getString(_prefSavedRooms),
+    );
+    final roomPrefs = _decodeJsonMap(await storage.getString(_prefRoomPrefs));
+    final roomMessages = _decodeJsonMap(
+      await storage.getString(_prefRoomMessages),
+    );
     final acgoConversationPrefs = _decodeJsonMap(
-      prefs.getString(_prefAcgoConversationPrefs),
+      await storage.getString(_prefAcgoConversationPrefs),
+    );
+    var acgoE2eeIdentity = AcgoE2ee.tryDecodeIdentity(
+      await storage.getString(_prefAcgoE2eeIdentity) ?? '',
+    );
+    if (acgoE2eeIdentity == null) {
+      acgoE2eeIdentity = AcgoE2ee.generateIdentity();
+      await storage.setString(
+        _prefAcgoE2eeIdentity,
+        AcgoE2ee.encodeIdentity(acgoE2eeIdentity),
+      );
+    }
+    final acgoPeerKeys = _decodeAcgoPeerKeys(
+      await storage.getString(_prefAcgoPeerKeys),
     );
     if (!mounted) {
       return;
@@ -292,6 +449,8 @@ class _ChatHomePageState extends State<ChatHomePage> {
       _birthday = birthday;
       _avatarData = avatarData;
       _downloadDirectory = downloadDirectory;
+      _portableMode = portableMode;
+      _portableRootDirectory = portableRoot;
       _acgoProfile = acgoProfile;
       _acgoAccessToken = acgoAccessToken;
       _acgoPrivateService = _createAcgoPrivateService(
@@ -333,6 +492,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
             ),
           ),
         );
+      _acgoE2eeIdentity = acgoE2eeIdentity;
+      _acgoPeerKeys
+        ..clear()
+        ..addAll(acgoPeerKeys);
       for (final entry in roomMessages.entries) {
         final messages = (entry.value as List)
             .whereType<Map>()
@@ -346,13 +509,120 @@ class _ChatHomePageState extends State<ChatHomePage> {
     if (acgoAccessToken.isNotEmpty) {
       unawaited(_loadAcgoConversations());
     }
-    if (prefs.getBool(_prefOobeDone) != true) {
+    if (avatarData.length > 120000) {
+      unawaited(_shrinkStoredAvatarData(avatarData));
+    }
+    if (await storage.getBool(_prefOobeDone) != true) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
           _showOobeDialog();
         }
       });
     }
+  }
+
+  _AppStorage _createStorage(
+    SharedPreferences sharedPreferences, {
+    required bool portableMode,
+    required String portableRootDirectory,
+  }) {
+    if (portableMode && portableRootDirectory.trim().isNotEmpty) {
+      return _PortableFileStorage(portableRootDirectory.trim());
+    }
+    return _SharedPrefsStorage(sharedPreferences);
+  }
+
+  Future<_AppStorage> _currentStorage() async {
+    final existing = _storage;
+    if (existing != null) return existing;
+    final sharedPreferences = await SharedPreferences.getInstance();
+    final storage = _createStorage(
+      sharedPreferences,
+      portableMode: sharedPreferences.getBool(_prefPortableMode) ?? false,
+      portableRootDirectory:
+          sharedPreferences.getString(_prefPortableRootDirectory) ?? '',
+    );
+    _storage = storage;
+    return storage;
+  }
+
+  String _portableDataDirectoryLabel(String rootDirectory) =>
+      '$rootDirectory${Platform.pathSeparator}fastchat';
+
+  Future<void> _saveSnapshotToStorage(
+    _AppStorage storage, {
+    required String displayName,
+    required String signature,
+    required String birthday,
+    required String avatarData,
+    required String downloadDirectory,
+    required bool globalMuted,
+    required AcgoProfileSummary? acgoProfile,
+    required String acgoAccessToken,
+    required bool oobeDone,
+  }) async {
+    if (displayName.isNotEmpty) {
+      await storage.setString(_prefDisplayName, displayName);
+    }
+    await storage.setString(_prefSignature, signature);
+    await storage.setString(_prefBirthday, birthday);
+    await storage.setString(_prefAvatarData, avatarData);
+    await storage.setBool(_prefGlobalMuted, globalMuted);
+    await storage.setBool(_prefOobeDone, oobeDone);
+    if (downloadDirectory.isEmpty) {
+      await storage.remove(_prefDownloadDirectory);
+    } else {
+      await storage.setString(_prefDownloadDirectory, downloadDirectory);
+    }
+    if (acgoProfile == null) {
+      await storage.remove(_prefAcgoProfile);
+      await storage.remove(_prefAcgoAccessToken);
+    } else {
+      await storage.setString(_prefAcgoProfile, acgoProfile.encode());
+      if (acgoAccessToken.isNotEmpty) {
+        await storage.setString(_prefAcgoAccessToken, acgoAccessToken);
+      }
+    }
+    await storage.setString(
+      _prefSavedRooms,
+      jsonEncode(
+        _savedJoinedRooms.values
+            .where((room) => _roomPrefs[room.id]?.hidden != true)
+            .map(_roomToJson)
+            .toList(),
+      ),
+    );
+    await storage.setString(
+      _prefRoomPrefs,
+      jsonEncode(_roomPrefs.map((key, value) => MapEntry(key, value.toJson()))),
+    );
+    await storage.setString(
+      _prefRoomMessages,
+      jsonEncode(_serializedMessages()),
+    );
+    await storage.setString(
+      _prefAcgoConversationPrefs,
+      jsonEncode(
+        _acgoConversationPrefs.map(
+          (key, value) => MapEntry(key, value.toJson()),
+        ),
+      ),
+    );
+    final identity = _acgoE2eeIdentity;
+    if (identity != null) {
+      await storage.setString(
+        _prefAcgoE2eeIdentity,
+        AcgoE2ee.encodeIdentity(identity),
+      );
+    }
+    await storage.setString(
+      _prefAcgoPeerKeys,
+      jsonEncode(
+        _acgoPeerKeys.map(
+          (userId, key) => MapEntry(userId, AcgoE2ee.encodePublicKey(key)),
+        ),
+      ),
+    );
   }
 
   AcgoPrivateMessageService? _createAcgoPrivateService(
@@ -399,6 +669,30 @@ class _ChatHomePageState extends State<ChatHomePage> {
     }
   }
 
+  Map<String, RSAPublicKey> _decodeAcgoPeerKeys(String? encoded) {
+    final decoded = _decodeJsonMap(encoded);
+    final keys = <String, RSAPublicKey>{};
+    for (final entry in decoded.entries) {
+      final key = AcgoE2ee.tryDecodePublicKey('${entry.value}');
+      if (key != null) {
+        keys[entry.key] = key;
+      }
+    }
+    return keys;
+  }
+
+  Future<void> _saveAcgoPeerKeys() async {
+    final storage = await _currentStorage();
+    await storage.setString(
+      _prefAcgoPeerKeys,
+      jsonEncode(
+        _acgoPeerKeys.map(
+          (userId, key) => MapEntry(userId, AcgoE2ee.encodePublicKey(key)),
+        ),
+      ),
+    );
+  }
+
   Map<String, dynamic> _roomToJson(DiscoveredRoom room) => {
     'id': room.id,
     'name': room.name,
@@ -422,6 +716,46 @@ class _ChatHomePageState extends State<ChatHomePage> {
         : int.tryParse(json['peers']?.toString() ?? '') ?? 1,
     relay: json['relay'] != false,
   );
+
+  Future<String> _avatarDataFromBytes(List<int> bytes) async {
+    try {
+      final codec = await ui.instantiateImageCodec(
+        Uint8List.fromList(bytes),
+        targetWidth: 128,
+        targetHeight: 128,
+      );
+      final frame = await codec.getNextFrame();
+      final byteData = await frame.image.toByteData(
+        format: ui.ImageByteFormat.png,
+      );
+      frame.image.dispose();
+      if (byteData == null) {
+        return base64Encode(bytes);
+      }
+      return base64Encode(byteData.buffer.asUint8List());
+    } catch (_) {
+      return base64Encode(bytes);
+    }
+  }
+
+  Future<void> _shrinkStoredAvatarData(String avatarData) async {
+    try {
+      final compact = await _avatarDataFromBytes(base64Decode(avatarData));
+      if (!mounted || compact.length >= avatarData.length) {
+        return;
+      }
+      final storage = await _currentStorage();
+      await storage.setString(_prefAvatarData, compact);
+      if (!mounted) return;
+      setState(() => _avatarData = compact);
+      _network.updateProfile(
+        signature: _signatureController.text.trim(),
+        birthday: _birthday,
+        avatarData: compact,
+        acgoInfo: _acgoProfile?.encode() ?? '',
+      );
+    } catch (_) {}
+  }
 
   Map<String, dynamic> _messageToJson(ChatMessage message) => {
     'sender': message.sender,
@@ -452,25 +786,25 @@ class _ChatHomePageState extends State<ChatHomePage> {
   );
 
   Future<void> _saveSavedRooms() async {
-    final prefs = await SharedPreferences.getInstance();
+    final storage = await _currentStorage();
     final visibleRooms = _savedJoinedRooms.values
         .where((room) => _roomPrefs[room.id]?.hidden != true)
         .map(_roomToJson)
         .toList();
-    await prefs.setString(_prefSavedRooms, jsonEncode(visibleRooms));
+    await storage.setString(_prefSavedRooms, jsonEncode(visibleRooms));
   }
 
   Future<void> _saveRoomPrefs() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
+    final storage = await _currentStorage();
+    await storage.setString(
       _prefRoomPrefs,
       jsonEncode(_roomPrefs.map((key, value) => MapEntry(key, value.toJson()))),
     );
   }
 
   Future<void> _saveAcgoConversationPrefs() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
+    final storage = await _currentStorage();
+    await storage.setString(
       _prefAcgoConversationPrefs,
       jsonEncode(
         _acgoConversationPrefs.map(
@@ -481,8 +815,18 @@ class _ChatHomePageState extends State<ChatHomePage> {
   }
 
   Future<void> _saveMessagesForRoom(String roomId) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_prefRoomMessages, jsonEncode(_serializedMessages()));
+    final storage = await _currentStorage();
+    await storage.setString(
+      _prefRoomMessages,
+      jsonEncode(_serializedMessages()),
+    );
+  }
+
+  void _scheduleMessagesSave(String roomId) {
+    _messageSaveTimer?.cancel();
+    _messageSaveTimer = Timer(const Duration(milliseconds: 120), () {
+      unawaited(_saveMessagesForRoom(roomId));
+    });
   }
 
   Map<String, dynamic> _serializedMessages() {
@@ -503,10 +847,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
   }
 
   Future<void> _removeMessagesForRoom(String roomId) async {
-    final prefs = await SharedPreferences.getInstance();
-    final existing = _decodeJsonMap(prefs.getString(_prefRoomMessages));
+    final storage = await _currentStorage();
+    final existing = _decodeJsonMap(await storage.getString(_prefRoomMessages));
     existing.remove(roomId);
-    await prefs.setString(_prefRoomMessages, jsonEncode(existing));
+    await storage.setString(_prefRoomMessages, jsonEncode(existing));
   }
 
   List<ChatMessage> _messagesForRoom(String roomId) {
@@ -518,6 +862,56 @@ class _ChatHomePageState extends State<ChatHomePage> {
             system: true,
           ),
         ];
+  }
+
+  String get _activeMessageListKey {
+    final acgoConversation = _activeAcgoConversation;
+    if (acgoConversation != null) {
+      return _acgoRoomId(acgoConversation.id);
+    }
+    return _activeRoom?.id ?? _lobbyRoomId;
+  }
+
+  List<ChatMessage> _windowedMessages(
+    String key,
+    List<ChatMessage> messages,
+  ) {
+    final limit = (_messageWindowLimits[key] ?? _messageWindowBatchSize).clamp(
+      0,
+      messages.length,
+    );
+    if (limit >= messages.length) {
+      return messages;
+    }
+    return messages.sublist(messages.length - limit);
+  }
+
+  void _resetMessageWindow(String key) {
+    _messageWindowLimits.remove(key);
+  }
+
+  void _maybeLoadOlderMessages() {
+    if (!_messagesScrollController.hasClients) {
+      return;
+    }
+    if (_messagesScrollController.position.pixels > 160) {
+      return;
+    }
+    final key = _activeMessageListKey;
+    final messages = key.startsWith('acgo:')
+        ? (_activeAcgoConversation == null
+              ? const <ChatMessage>[]
+              : _acgoMessagesByConversation[_activeAcgoConversation!.id] ??
+                    const <ChatMessage>[])
+        : _messagesForRoom(key);
+    final currentLimit = _messageWindowLimits[key] ?? _messageWindowBatchSize;
+    if (currentLimit >= messages.length) {
+      return;
+    }
+    setState(() {
+      _messageWindowLimits[key] =
+          (currentLimit + _messageWindowBatchSize).clamp(0, messages.length);
+    });
   }
 
   List<DiscoveredRoom> _orderedRooms(List<DiscoveredRoom> rooms) {
@@ -579,9 +973,9 @@ class _ChatHomePageState extends State<ChatHomePage> {
     if (_nameController.text.trim().isEmpty) {
       _nameController.text = '访客';
     }
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_prefDisplayName, _nameController.text.trim());
-    await prefs.setBool(_prefOobeDone, true);
+    final storage = await _currentStorage();
+    await storage.setString(_prefDisplayName, _nameController.text.trim());
+    await storage.setBool(_prefOobeDone, true);
   }
 
   Future<void> _finishOobe(
@@ -597,11 +991,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
 
   void _appendMessage(ChatMessage message) {
     final roomId = message.roomId ?? _activeRoom?.id ?? _lobbyRoomId;
-    setState(() {
-      _messagesByRoom.putIfAbsent(roomId, () => []).add(message);
-    });
+    _messagesByRoom.putIfAbsent(roomId, () => []).add(message);
+    _messagesVersion.value++;
     if (roomId != _lobbyRoomId) {
-      unawaited(_saveMessagesForRoom(roomId));
+      _scheduleMessagesSave(roomId);
     }
     final currentName = _nameController.text.trim();
     final messageRoom = _roomById(roomId);
@@ -687,10 +1080,8 @@ class _ChatHomePageState extends State<ChatHomePage> {
       if (!_messagesScrollController.hasClients) {
         return;
       }
-      _messagesScrollController.animateTo(
+      _messagesScrollController.jumpTo(
         _messagesScrollController.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 220),
-        curve: Curves.easeOutCubic,
       );
     });
   }
@@ -736,6 +1127,13 @@ class _ChatHomePageState extends State<ChatHomePage> {
 
   Future<void> _join(DiscoveredRoom room) async {
     try {
+      setState(() {
+        _activeRoom = room;
+        _activeAcgoConversation = null;
+        _error = '正在连接 ${room.name}...';
+      });
+      _resetMessageWindow(room.id);
+      await Future<void>.delayed(Duration.zero);
       await _network.joinRoom(
         room,
         displayName: _nameController.text.trim(),
@@ -772,11 +1170,18 @@ class _ChatHomePageState extends State<ChatHomePage> {
       return;
     }
     if (_activeRoom == null) return;
-    final roomId = _activeRoom!.id;
     _messageController.clear();
-    await _network.send(text, sender: _nameController.text.trim());
-    await Future<void>.delayed(Duration.zero);
-    await _saveMessagesForRoom(roomId);
+    Timer.run(() => unawaited(_sendTextInBackground(text)));
+  }
+
+  Future<void> _sendTextInBackground(String text) async {
+    try {
+      await _network.send(text, sender: _nameController.text.trim());
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = '发送失败：$e');
+      }
+    }
   }
 
   Future<void> _loadAcgoConversations() async {
@@ -827,6 +1232,8 @@ class _ChatHomePageState extends State<ChatHomePage> {
       _activeRoom = null;
       _error = null;
     });
+    _resetMessageWindow(_acgoRoomId(conversation.id));
+    unawaited(_ensureAcgoE2eeAdvertised(conversation));
     await _loadAcgoMessages(conversation);
   }
 
@@ -855,10 +1262,19 @@ class _ChatHomePageState extends State<ChatHomePage> {
         cursor = pageMessages.last.id;
       }
       if (!mounted) return;
+      final chatMessages = <ChatMessage>[];
+      final peerKeyCountBefore = _acgoPeerKeys.length;
+      for (final message in messages) {
+        final chatMessage = _chatMessageFromAcgoMessage(message, conversation);
+        if (chatMessage != null) {
+          chatMessages.add(chatMessage);
+        }
+      }
+      if (_acgoPeerKeys.length != peerKeyCountBefore) {
+        unawaited(_saveAcgoPeerKeys());
+      }
       setState(() {
-        _acgoMessagesByConversation[conversation.id] = messages
-            .map(_chatMessageFromAcgoMessage)
-            .toList();
+        _acgoMessagesByConversation[conversation.id] = chatMessages;
         _loadingAcgoMessages = false;
       });
       _scrollMessagesToBottom();
@@ -878,7 +1294,18 @@ class _ChatHomePageState extends State<ChatHomePage> {
     _messageController.clear();
     setState(() => _sendingAcgoMessage = true);
     try {
-      await service.sendText(conversation: conversation, text: text);
+      await _ensureAcgoE2eeAdvertised(conversation);
+      final peerKey = _acgoPeerKeys[conversation.receiverId];
+      final identity = _acgoE2eeIdentity;
+      final encrypted = peerKey != null && identity != null;
+      final outgoingText = encrypted
+          ? AcgoE2ee.encryptText(
+              text,
+              peerKey,
+              selfPublicKey: identity.publicKey,
+            )
+          : text;
+      await service.sendText(conversation: conversation, text: outgoingText);
       if (!mounted) return;
       final message = ChatMessage(
         sender: _nameController.text.trim().isEmpty
@@ -1039,20 +1466,55 @@ class _ChatHomePageState extends State<ChatHomePage> {
     }
   }
 
-  ChatMessage _chatMessageFromAcgoMessage(AcgoPrivateMessage message) =>
-      ChatMessage(
-        sender: message.mine
-            ? (_nameController.text.trim().isEmpty
-                  ? '我'
-                  : _nameController.text.trim())
-            : message.senderName,
-        text: message.text,
-        roomId: _acgoRoomId(message.conversationId),
-        senderSignature: message.mine ? _signatureController.text.trim() : null,
-        senderBirthday: message.mine ? _birthday : null,
-        senderAvatarData: message.mine ? _avatarData : null,
-        senderAcgoInfo: message.mine ? _acgoProfile?.encode() : null,
-      );
+  Future<void> _ensureAcgoE2eeAdvertised(
+    AcgoPrivateConversation conversation,
+  ) async {
+    final service = _acgoPrivateService;
+    final identity = _acgoE2eeIdentity;
+    if (service == null || identity == null) return;
+    if (!_advertisedAcgoKeyConversations.add(conversation.id)) return;
+    await service.sendText(
+      conversation: conversation,
+      text: AcgoE2ee.keyAdvertText(identity.publicKey),
+    );
+  }
+
+  ChatMessage? _chatMessageFromAcgoMessage(
+    AcgoPrivateMessage message,
+    AcgoPrivateConversation conversation,
+  ) {
+    final key = AcgoE2ee.tryReadKeyAdvert(message.text);
+    if (key != null && !message.mine) {
+      _acgoPeerKeys[conversation.receiverId] = key;
+      return null;
+    }
+    if (AcgoE2ee.isKeyAdvert(message.text)) {
+      return null;
+    }
+
+    var text = message.text;
+    final identity = _acgoE2eeIdentity;
+    if (AcgoE2ee.isEncryptedMessage(text)) {
+      final decrypted = identity == null
+          ? null
+          : AcgoE2ee.tryDecryptText(text, identity.privateKey);
+      text = decrypted ?? '无法解密的 FastChat 加密消息';
+    }
+
+    return ChatMessage(
+      sender: message.mine
+          ? (_nameController.text.trim().isEmpty
+                ? '我'
+                : _nameController.text.trim())
+          : message.senderName,
+      text: text,
+      roomId: _acgoRoomId(message.conversationId),
+      senderSignature: message.mine ? _signatureController.text.trim() : null,
+      senderBirthday: message.mine ? _birthday : null,
+      senderAvatarData: message.mine ? _avatarData : null,
+      senderAcgoInfo: message.mine ? _acgoProfile?.encode() : null,
+    );
+  }
 
   String _acgoRoomId(String conversationId) => 'acgo:$conversationId';
 
@@ -1126,7 +1588,6 @@ class _ChatHomePageState extends State<ChatHomePage> {
     if (_activeRoom == null) {
       return;
     }
-    final roomId = _activeRoom!.id;
     final result = await FilePicker.pickFiles();
     final file = result?.files.single;
     if (file == null) {
@@ -1139,8 +1600,6 @@ class _ChatHomePageState extends State<ChatHomePage> {
       fileSize: bytes.length,
       base64Data: base64Encode(bytes),
     );
-    await Future<void>.delayed(Duration.zero);
-    await _saveMessagesForRoom(roomId);
   }
 
   bool _handleHardwareKeyEvent(KeyEvent event) {
@@ -1182,8 +1641,6 @@ class _ChatHomePageState extends State<ChatHomePage> {
           sent = true;
         }
         if (sent) {
-          await Future<void>.delayed(Duration.zero);
-          await _saveMessagesForRoom(roomId);
           return;
         }
       }
@@ -1200,8 +1657,6 @@ class _ChatHomePageState extends State<ChatHomePage> {
         fileSize: image.length,
         base64Data: base64Encode(image),
       );
-      await Future<void>.delayed(Duration.zero);
-      await _saveMessagesForRoom(roomId);
     } catch (e) {
       if (mounted) {
         setState(() => _error = '粘贴附件失败：$e');
@@ -1232,6 +1687,13 @@ class _ChatHomePageState extends State<ChatHomePage> {
 
   Future<void> _openRoom(DiscoveredRoom room) async {
     try {
+      setState(() {
+        _activeRoom = room;
+        _activeAcgoConversation = null;
+        _error = '正在连接 ${room.name}...';
+      });
+      _resetMessageWindow(room.id);
+      await Future<void>.delayed(Duration.zero);
       if (_network.roomId == room.id ||
           _hostedRooms.any((r) => r.id == room.id) ||
           _joinedRooms.any((r) => r.id == room.id)) {
@@ -1257,9 +1719,46 @@ class _ChatHomePageState extends State<ChatHomePage> {
         ),
       );
     } catch (e) {
+      if (_savedJoinedRooms.containsKey(room.id)) {
+        await _hostSavedRoomTemporarily(room, e);
+      } else {
+        setState(() {
+          _activeRoom = room;
+          _error = '连接失败：$e';
+        });
+      }
+    }
+  }
+
+  Future<void> _hostSavedRoomTemporarily(
+    DiscoveredRoom room,
+    Object connectError,
+  ) async {
+    try {
+      final hostedRoom = await _network.hostRoom(
+        name: room.name,
+        relay: room.relay,
+        roomId: room.id,
+      );
+      if (!mounted) return;
+      setState(() {
+        _activeRoom = hostedRoom;
+        _activeAcgoConversation = null;
+        _error = null;
+      });
+      _appendMessage(
+        ChatMessage(
+          sender: '系统',
+          text: '保存的房间连接失败，已暂时由本机作为房主。',
+          system: true,
+          roomId: room.id,
+        ),
+      );
+    } catch (hostError) {
+      if (!mounted) return;
       setState(() {
         _activeRoom = room;
-        _error = '连接失败：$e';
+        _error = '连接失败：$connectError；临时开房失败：$hostError';
       });
     }
   }
@@ -1433,6 +1932,8 @@ class _ChatHomePageState extends State<ChatHomePage> {
     var muted = _globalMuted;
     var acgoProfile = _acgoProfile;
     var downloadDirectory = _downloadDirectory;
+    var portableMode = _portableMode;
+    var portableRootDirectory = _portableRootDirectory;
     showDialog<void>(
       context: context,
       builder: (context) => StatefulBuilder(
@@ -1512,8 +2013,11 @@ class _ChatHomePageState extends State<ChatHomePage> {
                             return;
                           }
                           final bytes = await file.readAsBytes();
+                          final compactAvatar = await _avatarDataFromBytes(
+                            bytes,
+                          );
                           setDialogState(
-                            () => avatarData = base64Encode(bytes),
+                            () => avatarData = compactAvatar,
                           );
                         },
                         icon: const Icon(Icons.image_outlined),
@@ -1560,6 +2064,65 @@ class _ChatHomePageState extends State<ChatHomePage> {
                     ],
                   ),
                 ),
+                const SizedBox(height: 12),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: portableMode,
+                  onChanged: (value) async {
+                    if (!value) {
+                      setDialogState(() => portableMode = false);
+                      return;
+                    }
+                    var selected = portableRootDirectory;
+                    if (selected.isEmpty) {
+                      selected =
+                          await FilePicker.getDirectoryPath(
+                            dialogTitle: '选择便携数据目录',
+                          ) ??
+                          '';
+                    }
+                    if (selected.isEmpty) return;
+                    setDialogState(() {
+                      portableMode = true;
+                      portableRootDirectory = selected;
+                    });
+                  },
+                  title: const Text('便携模式'),
+                  subtitle: Text(
+                    portableMode && portableRootDirectory.isNotEmpty
+                        ? _portableDataDirectoryLabel(portableRootDirectory)
+                        : '关闭时使用系统配置目录',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                if (portableMode)
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.inventory_2_outlined),
+                    title: const Text('便携数据目录'),
+                    subtitle: Text(
+                      portableRootDirectory.isEmpty
+                          ? '未选择'
+                          : _portableDataDirectoryLabel(portableRootDirectory),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    trailing: IconButton(
+                      tooltip: '选择目录',
+                      onPressed: () async {
+                        final selected = await FilePicker.getDirectoryPath(
+                          dialogTitle: '选择便携数据目录',
+                          initialDirectory: portableRootDirectory.isEmpty
+                              ? null
+                              : portableRootDirectory,
+                        );
+                        if (selected == null || selected.isEmpty) return;
+                        setDialogState(() => portableRootDirectory = selected);
+                      },
+                      icon: const Icon(Icons.drive_folder_upload_outlined),
+                    ),
+                  ),
                 const SizedBox(height: 12),
                 ListTile(
                   contentPadding: EdgeInsets.zero,
@@ -1630,35 +2193,47 @@ class _ChatHomePageState extends State<ChatHomePage> {
             FilledButton(
               onPressed: () async {
                 final navigator = Navigator.of(context);
-                final prefs = await SharedPreferences.getInstance();
+                final bootstrapPrefs = await SharedPreferences.getInstance();
+                if (portableMode && portableRootDirectory.trim().isEmpty) {
+                  final selected = await FilePicker.getDirectoryPath(
+                    dialogTitle: '选择便携数据目录',
+                  );
+                  if (selected == null || selected.isEmpty) return;
+                  portableRootDirectory = selected;
+                }
+                await bootstrapPrefs.setBool(_prefPortableMode, portableMode);
+                if (portableMode) {
+                  await bootstrapPrefs.setString(
+                    _prefPortableRootDirectory,
+                    portableRootDirectory.trim(),
+                  );
+                } else {
+                  await bootstrapPrefs.remove(_prefPortableRootDirectory);
+                }
+                final targetStorage = _createStorage(
+                  bootstrapPrefs,
+                  portableMode: portableMode,
+                  portableRootDirectory: portableRootDirectory,
+                );
+                _storage = targetStorage;
                 final name = settingsNameController.text.trim();
                 if (name.isNotEmpty) {
                   _nameController.text = name;
-                  await prefs.setString(_prefDisplayName, name);
                 }
                 final signature = settingsSignatureController.text.trim();
                 _signatureController.text = signature;
-                await prefs.setString(_prefSignature, signature);
-                await prefs.setString(_prefBirthday, birthday);
-                await prefs.setString(_prefAvatarData, avatarData);
-                await prefs.setBool(_prefGlobalMuted, muted);
-                if (downloadDirectory.isEmpty) {
-                  await prefs.remove(_prefDownloadDirectory);
-                } else {
-                  await prefs.setString(
-                    _prefDownloadDirectory,
-                    downloadDirectory,
-                  );
-                }
-                if (acgoProfile == null) {
-                  await prefs.remove(_prefAcgoProfile);
-                  await prefs.remove(_prefAcgoAccessToken);
-                } else {
-                  await prefs.setString(
-                    _prefAcgoProfile,
-                    acgoProfile!.encode(),
-                  );
-                }
+                await _saveSnapshotToStorage(
+                  targetStorage,
+                  displayName: name,
+                  signature: signature,
+                  birthday: birthday,
+                  avatarData: avatarData,
+                  downloadDirectory: downloadDirectory,
+                  globalMuted: muted,
+                  acgoProfile: acgoProfile,
+                  acgoAccessToken: _acgoAccessToken,
+                  oobeDone: true,
+                );
                 if (!mounted) {
                   return;
                 }
@@ -1666,6 +2241,8 @@ class _ChatHomePageState extends State<ChatHomePage> {
                   _birthday = birthday;
                   _avatarData = avatarData;
                   _downloadDirectory = downloadDirectory;
+                  _portableMode = portableMode;
+                  _portableRootDirectory = portableRootDirectory.trim();
                   _globalMuted = muted;
                   _acgoProfile = acgoProfile;
                 });
@@ -1685,8 +2262,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
         ),
       ),
     ).whenComplete(() {
-      settingsNameController.dispose();
-      settingsSignatureController.dispose();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        settingsNameController.dispose();
+        settingsSignatureController.dispose();
+      });
     });
   }
 
@@ -1838,10 +2417,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
     AcgoProfileSummary profile,
     String accessToken,
   ) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_prefAcgoProfile, profile.encode());
+    final storage = await _currentStorage();
+    await storage.setString(_prefAcgoProfile, profile.encode());
     if (accessToken.isNotEmpty) {
-      await prefs.setString(_prefAcgoAccessToken, accessToken);
+      await storage.setString(_prefAcgoAccessToken, accessToken);
     }
     if (!mounted) return;
     final resolvedToken = accessToken.isNotEmpty
@@ -1866,9 +2445,9 @@ class _ChatHomePageState extends State<ChatHomePage> {
   }
 
   Future<void> _clearAcgoBinding() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_prefAcgoProfile);
-    await prefs.remove(_prefAcgoAccessToken);
+    final storage = await _currentStorage();
+    await storage.remove(_prefAcgoProfile);
+    await storage.remove(_prefAcgoAccessToken);
     if (!mounted) return;
     final existingService = _acgoPrivateService;
     setState(() {
@@ -2095,9 +2674,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
     final data = avatarData == null || avatarData.isEmpty ? null : avatarData;
     if (data != null) {
       try {
+        final image = _cachedAvatarImage(data);
         return CircleAvatar(
           radius: radius,
-          backgroundImage: MemoryImage(base64Decode(data)),
+          backgroundImage: image,
         );
       } catch (_) {}
     }
@@ -2110,6 +2690,17 @@ class _ChatHomePageState extends State<ChatHomePage> {
         style: const TextStyle(fontWeight: FontWeight.w700),
       ),
     );
+  }
+
+  MemoryImage _cachedAvatarImage(String encoded) {
+    final cached = _avatarImageCache[encoded];
+    if (cached != null) return cached;
+    final image = MemoryImage(base64Decode(encoded));
+    if (_avatarImageCache.length >= 64) {
+      _avatarImageCache.remove(_avatarImageCache.keys.first);
+    }
+    _avatarImageCache[encoded] = image;
+    return image;
   }
 
   void _showUserInfo(ChatMessage message) {
@@ -2568,9 +3159,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
 
   Widget _buildChatPanel() {
     final acgoConversation = _activeAcgoConversation;
-    final visibleMessages = acgoConversation == null
-        ? _messagesForRoom(_activeRoom?.id ?? _lobbyRoomId)
-        : (_acgoMessagesByConversation[acgoConversation.id] ?? const []);
+    final messageListKey = _activeMessageListKey;
     final canChat = _activeRoom != null || acgoConversation != null;
     return Column(
       children: [
@@ -2629,14 +3218,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
           ),
         ),
         Expanded(
-          child: visibleMessages.isEmpty
-              ? const SizedBox()
-              : ListView.builder(
-                  controller: _messagesScrollController,
-                  padding: const EdgeInsets.all(24),
-                  itemCount: visibleMessages.length,
-                  itemBuilder: (_, i) => _messageBubble(visibleMessages[i]),
-                ),
+          child: ValueListenableBuilder<int>(
+            valueListenable: _messagesVersion,
+            builder: (context, _, _) => _buildMessagesList(messageListKey),
+          ),
         ),
         AnimatedSwitcher(
           duration: const Duration(milliseconds: 220),
@@ -2804,6 +3389,47 @@ class _ChatHomePageState extends State<ChatHomePage> {
     );
   }
 
+  Widget _buildMessagesList(String messageListKey) {
+    final allMessages = messageListKey.startsWith('acgo:')
+        ? (_activeAcgoConversation == null
+              ? const <ChatMessage>[]
+              : _acgoMessagesByConversation[_activeAcgoConversation!.id] ??
+                    const <ChatMessage>[])
+        : _messagesForRoom(messageListKey);
+    if (allMessages.isEmpty) {
+      return const SizedBox();
+    }
+    final visibleMessages = _windowedMessages(messageListKey, allMessages);
+    final hiddenMessageCount = allMessages.length - visibleMessages.length;
+    return ListView.builder(
+      key: ValueKey(messageListKey),
+      controller: _messagesScrollController,
+      padding: const EdgeInsets.all(24),
+      itemCount: visibleMessages.length + 1,
+      itemBuilder: (_, i) {
+        if (i == 0) {
+          return _olderMessagesHint(hiddenMessageCount);
+        }
+        return _messageBubble(visibleMessages[i - 1]);
+      },
+    );
+  }
+
+  Widget _olderMessagesHint(int hiddenMessageCount) {
+    if (hiddenMessageCount <= 0) {
+      return const SizedBox(height: 8);
+    }
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: Center(
+        child: Text(
+          '向上滚动加载更早的 $hiddenMessageCount 条消息',
+          style: TextStyle(color: Colors.grey.shade500, fontSize: 12),
+        ),
+      ),
+    );
+  }
+
   Widget _messageBubble(ChatMessage message) {
     if (message.system) {
       return Padding(
@@ -2931,7 +3557,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
   }
 
   Widget _imageTileContent(ChatMessage message, String size) {
-    final bytes = base64Decode(message.fileData ?? '');
+    final bytes = _cachedImageBytes(message.fileData ?? '');
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -2958,6 +3584,17 @@ class _ChatHomePageState extends State<ChatHomePage> {
         ),
       ],
     );
+  }
+
+  Uint8List _cachedImageBytes(String encoded) {
+    final cached = _imageBytesCache[encoded];
+    if (cached != null) return cached;
+    final bytes = base64Decode(encoded);
+    if (_imageBytesCache.length >= 32) {
+      _imageBytesCache.remove(_imageBytesCache.keys.first);
+    }
+    _imageBytesCache[encoded] = bytes;
+    return bytes;
   }
 
   Future<void> _saveAndOpenFile(ChatMessage message) async {

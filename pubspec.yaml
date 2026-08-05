@@ -42,6 +42,7 @@ dependencies:
   shared_preferences: ^2.5.3
   acgo_sdk:
     path: third_party/acgosdk
+  pointycastle: ^4.0.0
 
 dev_dependencies:
   flutter_test:

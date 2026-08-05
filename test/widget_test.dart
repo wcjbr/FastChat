@@ -1,5 +1,4 @@
-import 'dart:ui';
-
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:fast_chat/main.dart';
@@ -25,5 +24,20 @@ void main() {
     expect(find.text('Fast Chat'), findsOneWidget);
     expect(find.text('局域网房间'), findsOneWidget);
     expect(find.text('选择一个聊天室'), findsOneWidget);
+  });
+
+  testWidgets('settings dialog closes with escape', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const FastChatApp());
+
+    await tester.tap(find.byTooltip('设置'));
+    await tester.pumpAndSettle();
+    expect(find.text('设置'), findsOneWidget);
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    expect(find.text('设置'), findsNothing);
+    expect(tester.takeException(), isNull);
   });
 }

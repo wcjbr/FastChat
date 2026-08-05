@@ -11,7 +11,7 @@ class AcgoBindingService {
   }) async {
     final client = AcgoClient();
     try {
-      final login = await client.loginByPassword(account, password);
+      final login = await _login(client, account.trim(), password);
       final summary = await _loadSummary(client, account, loginPayload: login);
       return AcgoBindingResult(
         summary: summary,
@@ -20,6 +20,70 @@ class AcgoBindingService {
     } finally {
       client.close();
     }
+  }
+
+  Future<Object?> _login(
+    AcgoClient client,
+    String account,
+    String password,
+  ) async {
+    if (account.contains('@')) {
+      try {
+        final result = await client.request(
+          'POST',
+          '${client.ssoBaseUrl}/openapi/oauth/v3/loginByPassword',
+          jsonBody: {'email': account, 'password': password},
+          forceSign: true,
+        );
+        _rememberAuth(client, result);
+        return result;
+      } catch (_) {}
+    }
+    return client.loginByPassword(account, password);
+  }
+
+  void _rememberAuth(AcgoClient client, Object? payload) {
+    final token = _findFirstString(payload, const [
+      'accessToken',
+      'access_token',
+      'access-token',
+      'token',
+    ]);
+    final auth = _findFirstString(payload, const [
+      'authorization',
+      'Authorization',
+    ]);
+    final csrf = _findFirstString(payload, const [
+      'csrfToken',
+      'csrf_token',
+      'Csrf-Token',
+    ]);
+    if (token != null) {
+      client
+        ..accessToken = token
+        ..ssoAccessToken = token;
+    }
+    if (auth != null) client.authorization = auth;
+    if (csrf != null) client.csrfToken = csrf;
+  }
+
+  String? _findFirstString(Object? payload, List<String> keys) {
+    if (payload is Map) {
+      for (final key in keys) {
+        final value = payload[key];
+        if (value is String && value.isNotEmpty) return value;
+      }
+      for (final value in payload.values) {
+        final found = _findFirstString(value, keys);
+        if (found != null) return found;
+      }
+    } else if (payload is List) {
+      for (final item in payload) {
+        final found = _findFirstString(item, keys);
+        if (found != null) return found;
+      }
+    }
+    return null;
   }
 
   Future<AcgoProfileSummary> refresh({

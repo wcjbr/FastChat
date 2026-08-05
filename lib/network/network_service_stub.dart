@@ -80,6 +80,7 @@ class ChatNetworkService {
   Future<DiscoveredRoom> hostRoom({
     required String name,
     required bool relay,
+    String? roomId,
   }) async {
     throw UnsupportedError('网页端不支持创建和发现局域网房间，请运行原生客户端。');
   }
