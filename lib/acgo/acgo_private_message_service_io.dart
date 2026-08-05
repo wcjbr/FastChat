@@ -1,12 +1,13 @@
 import 'package:acgo_sdk/acgo_sdk.dart';
 
+import 'acgo_http_client_io.dart';
 import 'acgo_private_message_service_stub.dart';
 export 'acgo_private_message_service_stub.dart'
     show AcgoPrivateConversation, AcgoPrivateMessage;
 
 class AcgoPrivateMessageService {
   AcgoPrivateMessageService({required String accessToken, this._myUserId})
-    : _client = AcgoClient(accessToken: accessToken) {
+    : _client = FastChatAcgoHttp.createClient(accessToken: accessToken) {
     _client.ssoAccessToken = accessToken;
   }
 

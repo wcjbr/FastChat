@@ -1,5 +1,6 @@
 import 'package:acgo_sdk/acgo_sdk.dart';
 
+import 'acgo_http_client_io.dart';
 import 'acgo_binding_service_stub.dart';
 export 'acgo_binding_service_stub.dart'
     show AcgoBindingResult, AcgoProfileSummary;
@@ -9,7 +10,7 @@ class AcgoBindingService {
     required String account,
     required String password,
   }) async {
-    final client = AcgoClient();
+    final client = FastChatAcgoHttp.createClient();
     try {
       final login = await _login(client, account.trim(), password);
       final summary = await _loadSummary(client, account, loginPayload: login);
@@ -91,7 +92,7 @@ class AcgoBindingService {
     required String accessToken,
     AcgoProfileSummary? fallback,
   }) async {
-    final client = AcgoClient(accessToken: accessToken);
+    final client = FastChatAcgoHttp.createClient(accessToken: accessToken);
     client.ssoAccessToken = accessToken;
     try {
       return _loadSummary(client, account, fallback: fallback);
