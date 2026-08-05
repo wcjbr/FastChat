@@ -8,6 +8,8 @@ import 'package:open_file/open_file.dart';
 import 'package:pasteboard/pasteboard.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'acgo/acgo_binding_service.dart';
+import 'acgo/acgo_private_message_service.dart';
 import 'compat/compatibility.dart';
 import 'network/network_service.dart';
 import 'notifications/notification_service.dart';
@@ -124,15 +126,28 @@ class _ChatHomePageState extends State<ChatHomePage> {
   static const _prefSavedRooms = 'saved_rooms';
   static const _prefRoomPrefs = 'room_prefs';
   static const _prefRoomMessages = 'room_messages';
+  static const _prefAcgoProfile = 'acgo_profile';
+  static const _prefAcgoAccessToken = 'acgo_access_token';
   static const _lobbyRoomId = '__lobby__';
 
+  final _acgoService = AcgoBindingService();
   final _network = ChatNetworkService();
   final _messageController = TextEditingController();
   final _roomController = TextEditingController();
+  final _acgoReceiverController = TextEditingController();
   final _nameController = TextEditingController(text: '访客');
   final _signatureController = TextEditingController();
   String _birthday = '';
   String _avatarData = '';
+  AcgoProfileSummary? _acgoProfile;
+  String _acgoAccessToken = '';
+  AcgoPrivateMessageService? _acgoPrivateService;
+  List<AcgoPrivateConversation> _acgoConversations = [];
+  final Map<String, List<ChatMessage>> _acgoMessagesByConversation = {};
+  AcgoPrivateConversation? _activeAcgoConversation;
+  bool _loadingAcgoConversations = false;
+  bool _loadingAcgoMessages = false;
+  bool _sendingAcgoMessage = false;
   final _messagesScrollController = ScrollController();
   final Map<String, List<ChatMessage>> _messagesByRoom = {
     _lobbyRoomId: [
@@ -231,9 +246,11 @@ class _ChatHomePageState extends State<ChatHomePage> {
       timer.cancel();
     }
     _inAppNotificationTimers.clear();
+    _acgoPrivateService?.close();
     _network.dispose();
     _messageController.dispose();
     _roomController.dispose();
+    _acgoReceiverController.dispose();
     _nameController.dispose();
     _signatureController.dispose();
     _messagesScrollController.dispose();
@@ -246,6 +263,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
     final signature = prefs.getString(_prefSignature) ?? '';
     final birthday = prefs.getString(_prefBirthday) ?? '';
     final avatarData = prefs.getString(_prefAvatarData) ?? '';
+    final acgoProfile = AcgoProfileSummary.tryDecode(
+      prefs.getString(_prefAcgoProfile),
+    );
+    final acgoAccessToken = prefs.getString(_prefAcgoAccessToken) ?? '';
     final globalMuted = prefs.getBool(_prefGlobalMuted) ?? false;
     final savedRooms = _decodeJsonList(prefs.getString(_prefSavedRooms));
     final roomPrefs = _decodeJsonMap(prefs.getString(_prefRoomPrefs));
@@ -260,10 +281,17 @@ class _ChatHomePageState extends State<ChatHomePage> {
       _signatureController.text = signature;
       _birthday = birthday;
       _avatarData = avatarData;
+      _acgoProfile = acgoProfile;
+      _acgoAccessToken = acgoAccessToken;
+      _acgoPrivateService = _createAcgoPrivateService(
+        acgoAccessToken,
+        acgoProfile,
+      );
       _network.updateProfile(
         signature: signature,
         birthday: birthday,
         avatarData: avatarData,
+        acgoInfo: acgoProfile?.encode() ?? '',
       );
       _globalMuted = globalMuted;
       _savedJoinedRooms
@@ -294,6 +322,9 @@ class _ChatHomePageState extends State<ChatHomePage> {
         }
       }
     });
+    if (acgoAccessToken.isNotEmpty) {
+      unawaited(_loadAcgoConversations());
+    }
     if (prefs.getBool(_prefOobeDone) != true) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
@@ -301,6 +332,17 @@ class _ChatHomePageState extends State<ChatHomePage> {
         }
       });
     }
+  }
+
+  AcgoPrivateMessageService? _createAcgoPrivateService(
+    String accessToken,
+    AcgoProfileSummary? profile,
+  ) {
+    if (accessToken.isEmpty) return null;
+    return AcgoPrivateMessageService(
+      accessToken: accessToken,
+      myUserId: profile?.userId,
+    );
   }
 
   List<Map<String, dynamic>> _decodeJsonList(String? encoded) {
@@ -368,6 +410,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
     'senderSignature': message.senderSignature,
     'senderBirthday': message.senderBirthday,
     'senderAvatarData': message.senderAvatarData,
+    'senderAcgoInfo': message.senderAcgoInfo,
     'fileName': message.fileName,
     'fileSize': message.fileSize,
   };
@@ -380,6 +423,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
     senderSignature: json['senderSignature']?.toString(),
     senderBirthday: json['senderBirthday']?.toString(),
     senderAvatarData: json['senderAvatarData']?.toString(),
+    senderAcgoInfo: json['senderAcgoInfo']?.toString(),
     fileName: json['fileName']?.toString(),
     fileSize: json['fileSize'] is int
         ? json['fileSize'] as int
@@ -617,6 +661,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
       final room = await _network.hostRoom(name: name, relay: _relayEnabled);
       setState(() {
         _activeRoom = room;
+        _activeAcgoConversation = null;
         _savedJoinedRooms[room.id] = room;
         _roomPrefs[room.id] = (_roomPrefs[room.id] ?? const _RoomPrefs())
             .copyWith(hidden: false);
@@ -646,6 +691,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
       );
       setState(() {
         _activeRoom = room;
+        _activeAcgoConversation = null;
         _savedJoinedRooms[room.id] = room;
         _roomPrefs[room.id] = (_roomPrefs[room.id] ?? const _RoomPrefs())
             .copyWith(hidden: false);
@@ -668,13 +714,180 @@ class _ChatHomePageState extends State<ChatHomePage> {
 
   Future<void> _send() async {
     final text = _messageController.text.trim();
-    if (text.isEmpty || _activeRoom == null) return;
+    if (text.isEmpty) return;
+    if (_activeAcgoConversation != null) {
+      await _sendAcgoMessage(text);
+      return;
+    }
+    if (_activeRoom == null) return;
     final roomId = _activeRoom!.id;
     _messageController.clear();
     await _network.send(text, sender: _nameController.text.trim());
     await Future<void>.delayed(Duration.zero);
     await _saveMessagesForRoom(roomId);
   }
+
+  Future<void> _loadAcgoConversations() async {
+    final service = _acgoPrivateService;
+    if (service == null || _loadingAcgoConversations) return;
+    setState(() {
+      _loadingAcgoConversations = true;
+      _error = null;
+    });
+    try {
+      final conversations = await service.listConversations();
+      if (!mounted) return;
+      setState(() {
+        _acgoConversations = conversations;
+        _loadingAcgoConversations = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loadingAcgoConversations = false;
+        _error = '加载 ACGO 私信失败：$e';
+      });
+    }
+  }
+
+  Future<void> _openAcgoConversation(
+    AcgoPrivateConversation conversation,
+  ) async {
+    setState(() {
+      _activeAcgoConversation = conversation;
+      _activeRoom = null;
+      _error = null;
+    });
+    await _loadAcgoMessages(conversation);
+  }
+
+  Future<void> _loadAcgoMessages(AcgoPrivateConversation conversation) async {
+    final service = _acgoPrivateService;
+    if (service == null || _loadingAcgoMessages) return;
+    setState(() => _loadingAcgoMessages = true);
+    try {
+      final messages = await service.listMessages(conversation);
+      if (!mounted) return;
+      setState(() {
+        _acgoMessagesByConversation[conversation.id] = messages
+            .map(_chatMessageFromAcgoMessage)
+            .toList();
+        _loadingAcgoMessages = false;
+      });
+      _scrollMessagesToBottom();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loadingAcgoMessages = false;
+        _error = '加载 ACGO 私信消息失败：$e';
+      });
+    }
+  }
+
+  Future<void> _sendAcgoMessage(String text) async {
+    final service = _acgoPrivateService;
+    final conversation = _activeAcgoConversation;
+    if (service == null || conversation == null || _sendingAcgoMessage) return;
+    _messageController.clear();
+    setState(() => _sendingAcgoMessage = true);
+    try {
+      await service.sendText(conversation: conversation, text: text);
+      if (!mounted) return;
+      final message = ChatMessage(
+        sender: _nameController.text.trim().isEmpty
+            ? '我'
+            : _nameController.text.trim(),
+        text: text,
+        roomId: _acgoRoomId(conversation.id),
+        senderSignature: _signatureController.text.trim(),
+        senderBirthday: _birthday,
+        senderAvatarData: _avatarData,
+        senderAcgoInfo: _acgoProfile?.encode(),
+      );
+      setState(() {
+        _acgoMessagesByConversation
+            .putIfAbsent(conversation.id, () => [])
+            .add(message);
+        _sendingAcgoMessage = false;
+      });
+      _scrollMessagesToBottom();
+      unawaited(_loadAcgoConversations());
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _sendingAcgoMessage = false;
+        _error = '发送 ACGO 私信失败：$e';
+      });
+    }
+  }
+
+  Future<void> _showNewAcgoConversationDialog() async {
+    _acgoReceiverController.clear();
+    final receiverId = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('新建 ACGO 私信'),
+        content: TextField(
+          controller: _acgoReceiverController,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '对方 UID',
+            prefixIcon: Icon(Icons.alternate_email),
+          ),
+          onSubmitted: (value) => Navigator.pop(context, value.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(context, _acgoReceiverController.text.trim()),
+            child: const Text('开始'),
+          ),
+        ],
+      ),
+    );
+    if (receiverId == null || receiverId.isEmpty) return;
+    AcgoPrivateConversation? existing;
+    for (final conversation in _acgoConversations) {
+      if (conversation.receiverId == receiverId) {
+        existing = conversation;
+        break;
+      }
+    }
+    final conversation =
+        existing ??
+        AcgoPrivateConversation(
+          id: receiverId,
+          receiverId: receiverId,
+          title: 'UID $receiverId',
+        );
+    if (existing == null) {
+      setState(
+        () => _acgoConversations = [conversation, ..._acgoConversations],
+      );
+    }
+    await _openAcgoConversation(conversation);
+  }
+
+  ChatMessage _chatMessageFromAcgoMessage(AcgoPrivateMessage message) =>
+      ChatMessage(
+        sender: message.mine
+            ? (_nameController.text.trim().isEmpty
+                  ? '我'
+                  : _nameController.text.trim())
+            : message.senderName,
+        text: message.text,
+        roomId: _acgoRoomId(message.conversationId),
+        senderSignature: message.mine ? _signatureController.text.trim() : null,
+        senderBirthday: message.mine ? _birthday : null,
+        senderAvatarData: message.mine ? _avatarData : null,
+        senderAcgoInfo: message.mine ? _acgoProfile?.encode() : null,
+      );
+
+  String _acgoRoomId(String conversationId) => 'acgo:$conversationId';
 
   void _insertMessageNewline() {
     final selection = _messageController.selection;
@@ -865,6 +1078,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
       }
       setState(() {
         _activeRoom = room;
+        _activeAcgoConversation = null;
         _error = null;
       });
       _appendMessage(
@@ -1050,6 +1264,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
     var birthday = _birthday;
     var avatarData = _avatarData;
     var muted = _globalMuted;
+    var acgoProfile = _acgoProfile;
     showDialog<void>(
       context: context,
       builder: (context) => StatefulBuilder(
@@ -1135,6 +1350,55 @@ class _ChatHomePageState extends State<ChatHomePage> {
                 ),
               ),
               const SizedBox(height: 12),
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.link_outlined),
+                title: const Text('ACGO 账号'),
+                subtitle: Text(
+                  acgoProfile == null
+                      ? '未绑定'
+                      : '${acgoProfile!.displayName} · ${acgoProfile!.problemText}',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                trailing: Wrap(
+                  spacing: 4,
+                  children: [
+                    if (acgoProfile != null)
+                      IconButton(
+                        tooltip: '刷新',
+                        onPressed: () async {
+                          final updated = await _refreshAcgoProfile();
+                          if (updated != null) {
+                            setDialogState(() => acgoProfile = updated);
+                          }
+                        },
+                        icon: const Icon(Icons.refresh),
+                      ),
+                    if (acgoProfile != null)
+                      IconButton(
+                        tooltip: '解绑',
+                        onPressed: () async {
+                          await _clearAcgoBinding();
+                          setDialogState(() => acgoProfile = null);
+                        },
+                        icon: const Icon(Icons.link_off_outlined),
+                      )
+                    else
+                      IconButton(
+                        tooltip: '绑定',
+                        onPressed: () async {
+                          final bound = await _showAcgoBindDialog();
+                          if (bound != null) {
+                            setDialogState(() => acgoProfile = bound);
+                          }
+                        },
+                        icon: const Icon(Icons.login),
+                      ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
                 value: muted,
@@ -1166,6 +1430,15 @@ class _ChatHomePageState extends State<ChatHomePage> {
                 await prefs.setString(_prefBirthday, birthday);
                 await prefs.setString(_prefAvatarData, avatarData);
                 await prefs.setBool(_prefGlobalMuted, muted);
+                if (acgoProfile == null) {
+                  await prefs.remove(_prefAcgoProfile);
+                  await prefs.remove(_prefAcgoAccessToken);
+                } else {
+                  await prefs.setString(
+                    _prefAcgoProfile,
+                    acgoProfile!.encode(),
+                  );
+                }
                 if (!mounted) {
                   return;
                 }
@@ -1173,11 +1446,13 @@ class _ChatHomePageState extends State<ChatHomePage> {
                   _birthday = birthday;
                   _avatarData = avatarData;
                   _globalMuted = muted;
+                  _acgoProfile = acgoProfile;
                 });
                 _network.updateProfile(
                   signature: signature,
                   birthday: birthday,
                   avatarData: avatarData,
+                  acgoInfo: acgoProfile?.encode() ?? '',
                 );
                 if (navigator.mounted) {
                   navigator.pop();
@@ -1192,6 +1467,204 @@ class _ChatHomePageState extends State<ChatHomePage> {
       settingsNameController.dispose();
       settingsSignatureController.dispose();
     });
+  }
+
+  Future<AcgoProfileSummary?> _showAcgoBindDialog() async {
+    final accountController = TextEditingController();
+    final passwordController = TextEditingController();
+    var binding = false;
+    String? error;
+    try {
+      return await showDialog<AcgoProfileSummary>(
+        context: context,
+        builder: (context) => StatefulBuilder(
+          builder: (context, setDialogState) => AlertDialog(
+            title: const Text('绑定 ACGO 账号'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: accountController,
+                  autofocus: true,
+                  decoration: const InputDecoration(
+                    labelText: '账号 / 手机号 / 邮箱',
+                    prefixIcon: Icon(Icons.account_circle_outlined),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: passwordController,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    labelText: '密码',
+                    prefixIcon: Icon(Icons.password_outlined),
+                  ),
+                  onSubmitted: (_) {
+                    if (!binding) {
+                      unawaited(
+                        _bindAcgoFromDialog(
+                          accountController.text,
+                          passwordController.text,
+                          Navigator.of(context),
+                          setDialogState,
+                          (value) => error = value,
+                          (value) => binding = value,
+                        ),
+                      );
+                    }
+                  },
+                ),
+                if (error != null) ...[
+                  const SizedBox(height: 10),
+                  Text(error!, style: TextStyle(color: Colors.red.shade700)),
+                ],
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: binding ? null : () => Navigator.pop(context),
+                child: const Text('取消'),
+              ),
+              FilledButton(
+                onPressed: binding
+                    ? null
+                    : () {
+                        unawaited(
+                          _bindAcgoFromDialog(
+                            accountController.text,
+                            passwordController.text,
+                            Navigator.of(context),
+                            setDialogState,
+                            (value) => error = value,
+                            (value) => binding = value,
+                          ),
+                        );
+                      },
+                child: binding
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('绑定'),
+              ),
+            ],
+          ),
+        ),
+      );
+    } finally {
+      accountController.dispose();
+      passwordController.dispose();
+    }
+  }
+
+  Future<void> _bindAcgoFromDialog(
+    String account,
+    String password,
+    NavigatorState navigator,
+    void Function(void Function()) setDialogState,
+    void Function(String?) setError,
+    void Function(bool) setBinding,
+  ) async {
+    account = account.trim();
+    if (account.isEmpty || password.isEmpty) {
+      setDialogState(() => setError('请输入账号和密码'));
+      return;
+    }
+    setDialogState(() {
+      setError(null);
+      setBinding(true);
+    });
+    try {
+      final result = await _acgoService.bindWithPassword(
+        account: account,
+        password: password,
+      );
+      await _saveAcgoBinding(result.summary, result.accessToken ?? '');
+      if (navigator.mounted) {
+        navigator.pop(result.summary);
+      }
+    } catch (e) {
+      setDialogState(() {
+        setError('绑定失败：$e');
+        setBinding(false);
+      });
+    }
+  }
+
+  Future<AcgoProfileSummary?> _refreshAcgoProfile() async {
+    final profile = _acgoProfile;
+    if (profile == null || _acgoAccessToken.isEmpty) {
+      return null;
+    }
+    try {
+      final updated = await _acgoService.refresh(
+        account: profile.account,
+        accessToken: _acgoAccessToken,
+        fallback: profile,
+      );
+      await _saveAcgoBinding(updated, _acgoAccessToken);
+      return updated;
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = '刷新 ACGO 信息失败：$e');
+      }
+      return null;
+    }
+  }
+
+  Future<void> _saveAcgoBinding(
+    AcgoProfileSummary profile,
+    String accessToken,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_prefAcgoProfile, profile.encode());
+    if (accessToken.isNotEmpty) {
+      await prefs.setString(_prefAcgoAccessToken, accessToken);
+    }
+    if (!mounted) return;
+    final resolvedToken = accessToken.isNotEmpty
+        ? accessToken
+        : _acgoAccessToken;
+    final existingService = _acgoPrivateService;
+    setState(() {
+      _acgoProfile = profile;
+      _acgoAccessToken = resolvedToken;
+      _acgoPrivateService = _createAcgoPrivateService(resolvedToken, profile);
+    });
+    existingService?.close();
+    if (resolvedToken.isNotEmpty) {
+      unawaited(_loadAcgoConversations());
+    }
+    _network.updateProfile(
+      signature: _signatureController.text.trim(),
+      birthday: _birthday,
+      avatarData: _avatarData,
+      acgoInfo: profile.encode(),
+    );
+  }
+
+  Future<void> _clearAcgoBinding() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_prefAcgoProfile);
+    await prefs.remove(_prefAcgoAccessToken);
+    if (!mounted) return;
+    final existingService = _acgoPrivateService;
+    setState(() {
+      _acgoProfile = null;
+      _acgoAccessToken = '';
+      _acgoPrivateService = null;
+      _acgoConversations = [];
+      _acgoMessagesByConversation.clear();
+      _activeAcgoConversation = null;
+    });
+    existingService?.close();
+    _network.updateProfile(
+      signature: _signatureController.text.trim(),
+      birthday: _birthday,
+      avatarData: _avatarData,
+      acgoInfo: '',
+    );
   }
 
   @override
@@ -1421,6 +1894,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
   void _showUserInfo(ChatMessage message) {
     final birthday = message.senderBirthday ?? '';
     final age = _ageFromBirthday(birthday);
+    final acgoProfile = AcgoProfileSummary.tryDecode(message.senderAcgoInfo);
     showDialog<void>(
       context: context,
       builder: (context) => AlertDialog(
@@ -1452,6 +1926,14 @@ class _ChatHomePageState extends State<ChatHomePage> {
             ),
             const SizedBox(height: 10),
             _UserInfoLine(label: '年龄', value: age == null ? '未知' : '$age 岁'),
+            const SizedBox(height: 10),
+            if (acgoProfile == null)
+              const _UserInfoLine(label: 'ACGO 账号', value: '未绑定')
+            else ...[
+              _UserInfoLine(label: 'ACGO 账号', value: acgoProfile.displayName),
+              const SizedBox(height: 10),
+              _UserInfoLine(label: '刷题信息', value: acgoProfile.problemText),
+            ],
           ],
         ),
         actions: [
@@ -1548,70 +2030,65 @@ class _ChatHomePageState extends State<ChatHomePage> {
           ),
         const SizedBox(height: 14),
         Expanded(
-          child:
-              _hostedRooms.isEmpty &&
-                  _visibleSavedJoinedRooms.isEmpty &&
-                  _visibleDiscoveredRooms.isEmpty
-              ? const Center(
-                  child: Text(
-                    '暂未发现房间\n点击左侧创建一个',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(color: Colors.black45, height: 1.6),
+          child: ListView(
+            children: [
+              _buildAcgoPrivateSection(),
+              if (_hostedRooms.isNotEmpty)
+                _roomSection(
+                  title: '我创建的房间',
+                  rooms: _orderedRooms(_hostedRooms),
+                  tileBuilder: (room) => _roomTile(
+                    room,
+                    onTap: () => _openRoom(room),
+                    onSecondaryTapDown: (details) =>
+                        _showRoomContextMenu(room, details.globalPosition),
+                    trailing: IconButton(
+                      tooltip: '关闭房间',
+                      onPressed: () => _closeHostedRoom(room),
+                      icon: const Icon(Icons.close, size: 18),
+                    ),
                   ),
-                )
-              : ListView(
-                  children: [
-                    if (_hostedRooms.isNotEmpty)
-                      _roomSection(
-                        title: '我创建的房间',
-                        rooms: _orderedRooms(_hostedRooms),
-                        tileBuilder: (room) => _roomTile(
-                          room,
-                          onTap: () => _openRoom(room),
-                          onSecondaryTapDown: (details) => _showRoomContextMenu(
-                            room,
-                            details.globalPosition,
-                          ),
-                          trailing: IconButton(
-                            tooltip: '关闭房间',
-                            onPressed: () => _closeHostedRoom(room),
-                            icon: const Icon(Icons.close, size: 18),
-                          ),
-                        ),
-                      ),
-                    if (_visibleSavedJoinedRooms.isNotEmpty)
-                      _roomSection(
-                        title: '我加入的房间',
-                        rooms: _orderedRooms(_visibleSavedJoinedRooms),
-                        tileBuilder: (room) => _roomTile(
-                          room,
-                          onTap: () => _openRoom(room),
-                          onSecondaryTapDown: (details) => _showRoomContextMenu(
-                            room,
-                            details.globalPosition,
-                          ),
-                          trailing: IconButton(
-                            tooltip: '离开房间',
-                            onPressed: () => _closeJoinedRoom(room),
-                            icon: const Icon(Icons.logout, size: 18),
-                          ),
-                        ),
-                      ),
-                    if (_visibleDiscoveredRooms.isNotEmpty)
-                      _roomSection(
-                        title: '局域网发现',
-                        rooms: _orderedRooms(_visibleDiscoveredRooms),
-                        tileBuilder: (room) => _roomTile(
-                          room,
-                          onTap: () => _join(room),
-                          onSecondaryTapDown: (details) => _showRoomContextMenu(
-                            room,
-                            details.globalPosition,
-                          ),
-                        ),
-                      ),
-                  ],
                 ),
+              if (_visibleSavedJoinedRooms.isNotEmpty)
+                _roomSection(
+                  title: '我加入的房间',
+                  rooms: _orderedRooms(_visibleSavedJoinedRooms),
+                  tileBuilder: (room) => _roomTile(
+                    room,
+                    onTap: () => _openRoom(room),
+                    onSecondaryTapDown: (details) =>
+                        _showRoomContextMenu(room, details.globalPosition),
+                    trailing: IconButton(
+                      tooltip: '离开房间',
+                      onPressed: () => _closeJoinedRoom(room),
+                      icon: const Icon(Icons.logout, size: 18),
+                    ),
+                  ),
+                ),
+              if (_visibleDiscoveredRooms.isNotEmpty)
+                _roomSection(
+                  title: '局域网发现',
+                  rooms: _orderedRooms(_visibleDiscoveredRooms),
+                  tileBuilder: (room) => _roomTile(
+                    room,
+                    onTap: () => _join(room),
+                    onSecondaryTapDown: (details) =>
+                        _showRoomContextMenu(room, details.globalPosition),
+                  ),
+                ),
+              if (_hostedRooms.isEmpty &&
+                  _visibleSavedJoinedRooms.isEmpty &&
+                  _visibleDiscoveredRooms.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 18),
+                  child: Text(
+                    '暂未发现局域网房间\n点击上方创建一个',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.grey.shade600, height: 1.6),
+                  ),
+                ),
+            ],
+          ),
         ),
         Material(
           color: Colors.transparent,
@@ -1627,6 +2104,131 @@ class _ChatHomePageState extends State<ChatHomePage> {
       ],
     ),
   );
+
+  Widget _buildAcgoPrivateSection() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Text(
+                'ACGO 私信',
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
+              ),
+              const Spacer(),
+              if (_loadingAcgoConversations)
+                const SizedBox(
+                  width: 13,
+                  height: 13,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              IconButton(
+                tooltip: '刷新 ACGO 私信',
+                visualDensity: VisualDensity.compact,
+                onPressed: _acgoPrivateService == null
+                    ? null
+                    : _loadAcgoConversations,
+                icon: const Icon(Icons.refresh, size: 18),
+              ),
+              IconButton(
+                tooltip: '新建 ACGO 私信',
+                visualDensity: VisualDensity.compact,
+                onPressed: _acgoPrivateService == null
+                    ? null
+                    : _showNewAcgoConversationDialog,
+                icon: const Icon(Icons.add_comment_outlined, size: 18),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          if (_acgoPrivateService == null)
+            Text(
+              '绑定 ACGO 账号后可使用私信',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+            )
+          else if (_acgoConversations.isEmpty && !_loadingAcgoConversations)
+            Text(
+              '暂无私信会话',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+            )
+          else
+            ..._acgoConversations.map(
+              (conversation) => Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: _acgoConversationTile(conversation),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _acgoConversationTile(AcgoPrivateConversation conversation) {
+    final selected = _activeAcgoConversation?.id == conversation.id;
+    return InkWell(
+      onTap: () => _openAcgoConversation(conversation),
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.all(13),
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xffd7ebe5) : Colors.white,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: selected ? const Color(0xff75b7a5) : const Color(0xffe1e9e6),
+          ),
+        ),
+        child: Row(
+          children: [
+            const CircleAvatar(
+              backgroundColor: Color(0xffe6f0ff),
+              foregroundColor: Color(0xff2457a6),
+              child: Icon(Icons.alternate_email, size: 18),
+            ),
+            const SizedBox(width: 11),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    conversation.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    conversation.lastMessage?.isNotEmpty == true
+                        ? conversation.lastMessage!
+                        : 'UID ${conversation.receiverId}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                  ),
+                ],
+              ),
+            ),
+            if (conversation.unread > 0)
+              Container(
+                margin: const EdgeInsets.only(left: 8),
+                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                decoration: BoxDecoration(
+                  color: const Color(0xff176b5b),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Text(
+                  conversation.unread > 99 ? '99+' : '${conversation.unread}',
+                  style: const TextStyle(color: Colors.white, fontSize: 11),
+                ),
+              )
+            else
+              const Icon(Icons.chevron_right, size: 18, color: Colors.black38),
+          ],
+        ),
+      ),
+    );
+  }
 
   Widget _roomSection({
     required String title,
@@ -1728,7 +2330,11 @@ class _ChatHomePageState extends State<ChatHomePage> {
   }
 
   Widget _buildChatPanel() {
-    final visibleMessages = _messagesForRoom(_activeRoom?.id ?? _lobbyRoomId);
+    final acgoConversation = _activeAcgoConversation;
+    final visibleMessages = acgoConversation == null
+        ? _messagesForRoom(_activeRoom?.id ?? _lobbyRoomId)
+        : (_acgoMessagesByConversation[acgoConversation.id] ?? const []);
+    final canChat = _activeRoom != null || acgoConversation != null;
     return Column(
       children: [
         Container(
@@ -1741,9 +2347,11 @@ class _ChatHomePageState extends State<ChatHomePage> {
           child: Row(
             children: [
               Icon(
-                _activeRoom == null
-                    ? Icons.chat_bubble_outline
-                    : Icons.lock_outline,
+                acgoConversation != null
+                    ? Icons.alternate_email
+                    : (_activeRoom == null
+                          ? Icons.chat_bubble_outline
+                          : Icons.lock_outline),
                 color: const Color(0xff176b5b),
               ),
               const SizedBox(width: 12),
@@ -1752,13 +2360,17 @@ class _ChatHomePageState extends State<ChatHomePage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    _activeRoom?.name ?? '选择一个聊天室',
+                    acgoConversation?.title ?? _activeRoom?.name ?? '选择一个聊天室',
                     style: const TextStyle(fontWeight: FontWeight.w700),
                   ),
                   Text(
-                    _activeRoom == null
-                        ? '消息仅在局域网内传输'
-                        : '${_activeRoom!.peers} 位成员在线',
+                    acgoConversation != null
+                        ? (_loadingAcgoMessages
+                              ? '正在加载 ACGO 私信'
+                              : 'ACGO 私信 · UID ${acgoConversation.receiverId}')
+                        : (_activeRoom == null
+                              ? '消息仅在局域网内传输'
+                              : '${_activeRoom!.peers} 位成员在线'),
                     style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
                   ),
                 ],
@@ -1769,6 +2381,12 @@ class _ChatHomePageState extends State<ChatHomePage> {
                   tooltip: '离开房间',
                   onPressed: _leave,
                   icon: const Icon(Icons.logout, size: 20),
+                ),
+              if (acgoConversation != null)
+                IconButton(
+                  tooltip: '刷新私信',
+                  onPressed: () => _loadAcgoMessages(acgoConversation),
+                  icon: const Icon(Icons.refresh, size: 20),
                 ),
             ],
           ),
@@ -1819,7 +2437,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
               actions: {
                 SendMessageIntent: CallbackAction<SendMessageIntent>(
                   onInvoke: (_) {
-                    if (_activeRoom != null) {
+                    if (canChat) {
                       _send();
                     }
                     return null;
@@ -1827,7 +2445,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
                 ),
                 InsertNewlineIntent: CallbackAction<InsertNewlineIntent>(
                   onInvoke: (_) {
-                    if (_activeRoom != null) {
+                    if (canChat) {
                       _insertMessageNewline();
                     }
                     return null;
@@ -1838,7 +2456,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
                 children: [
                   Expanded(
                     child: TextField(
-                      enabled: _activeRoom != null,
+                      enabled: canChat && !_sendingAcgoMessage,
                       controller: _messageController,
                       minLines: 1,
                       maxLines: 4,
@@ -1846,9 +2464,9 @@ class _ChatHomePageState extends State<ChatHomePage> {
                       textInputAction: TextInputAction.send,
                       onSubmitted: (_) => _send(),
                       decoration: InputDecoration(
-                        hintText: _activeRoom == null
-                            ? '加入房间后开始聊天'
-                            : '输入消息，Enter 发送，Shift+Enter 换行',
+                        hintText: canChat
+                            ? '输入消息，Enter 发送，Shift+Enter 换行'
+                            : '加入房间或选择 ACGO 私信后开始聊天',
                         filled: true,
                         fillColor: const Color(0xfff0f4f3),
                         border: OutlineInputBorder(
@@ -1865,13 +2483,22 @@ class _ChatHomePageState extends State<ChatHomePage> {
                   const SizedBox(width: 10),
                   IconButton(
                     tooltip: '发送文件',
-                    onPressed: _activeRoom == null ? null : _sendFile,
+                    onPressed:
+                        _activeRoom == null || _activeAcgoConversation != null
+                        ? null
+                        : _sendFile,
                     icon: const Icon(Icons.attach_file),
                   ),
                   IconButton.filled(
                     tooltip: '发送',
-                    onPressed: _activeRoom == null ? null : _send,
-                    icon: const Icon(Icons.send_rounded),
+                    onPressed: canChat && !_sendingAcgoMessage ? _send : null,
+                    icon: _sendingAcgoMessage
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.send_rounded),
                   ),
                 ],
               ),

@@ -40,6 +40,8 @@ dependencies:
   path_provider: ^2.1.6
   open_file: ^4.0.0
   shared_preferences: ^2.5.3
+  acgo_sdk:
+    path: /home/archzero/C++/acgosdk
 
 dev_dependencies:
   flutter_test:

@@ -24,6 +24,7 @@ class ChatMessage {
     this.senderSignature,
     this.senderBirthday,
     this.senderAvatarData,
+    this.senderAcgoInfo,
     this.fileName,
     this.fileSize,
     this.fileData,
@@ -34,6 +35,7 @@ class ChatMessage {
   final String? senderSignature;
   final String? senderBirthday;
   final String? senderAvatarData;
+  final String? senderAcgoInfo;
   final String? fileName;
   final int? fileSize;
   final String? fileData;
@@ -98,6 +100,7 @@ class ChatNetworkService {
     required String signature,
     required String birthday,
     required String avatarData,
+    required String acgoInfo,
   }) {}
 
   Future<void> sendFile({
