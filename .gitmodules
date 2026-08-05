@@ -1,0 +1,3 @@
+[submodule "third_party/acgosdk"]
+	path = third_party/acgosdk
+	url = https://github.com/wcjbr/acgosdk

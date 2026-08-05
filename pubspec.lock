@@ -4,8 +4,8 @@ packages:
   acgo_sdk:
     dependency: "direct main"
     description:
-      path: "/home/archzero/C++/acgosdk"
-      relative: false
+      path: "third_party/acgosdk"
+      relative: true
     source: path
     version: "0.1.0"
   args:

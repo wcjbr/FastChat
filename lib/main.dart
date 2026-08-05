@@ -44,6 +44,8 @@ class NativeWindow {
 
 enum _RoomAction { pin, mute, delete }
 
+enum _AcgoConversationAction { pin, delete }
+
 class _InAppNotification {
   const _InAppNotification({
     required this.id,
@@ -128,6 +130,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
   static const _prefRoomMessages = 'room_messages';
   static const _prefAcgoProfile = 'acgo_profile';
   static const _prefAcgoAccessToken = 'acgo_access_token';
+  static const _prefAcgoConversationPrefs = 'acgo_conversation_prefs';
   static const _lobbyRoomId = '__lobby__';
 
   final _acgoService = AcgoBindingService();
@@ -144,6 +147,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
   AcgoPrivateMessageService? _acgoPrivateService;
   List<AcgoPrivateConversation> _acgoConversations = [];
   final Map<String, List<ChatMessage>> _acgoMessagesByConversation = {};
+  final Map<String, _RoomPrefs> _acgoConversationPrefs = {};
   AcgoPrivateConversation? _activeAcgoConversation;
   bool _loadingAcgoConversations = false;
   bool _loadingAcgoMessages = false;
@@ -271,6 +275,9 @@ class _ChatHomePageState extends State<ChatHomePage> {
     final savedRooms = _decodeJsonList(prefs.getString(_prefSavedRooms));
     final roomPrefs = _decodeJsonMap(prefs.getString(_prefRoomPrefs));
     final roomMessages = _decodeJsonMap(prefs.getString(_prefRoomMessages));
+    final acgoConversationPrefs = _decodeJsonMap(
+      prefs.getString(_prefAcgoConversationPrefs),
+    );
     if (!mounted) {
       return;
     }
@@ -306,6 +313,16 @@ class _ChatHomePageState extends State<ChatHomePage> {
         ..clear()
         ..addEntries(
           roomPrefs.entries.map(
+            (entry) => MapEntry(
+              entry.key,
+              _RoomPrefs.fromJson(Map<String, dynamic>.from(entry.value)),
+            ),
+          ),
+        );
+      _acgoConversationPrefs
+        ..clear()
+        ..addEntries(
+          acgoConversationPrefs.entries.map(
             (entry) => MapEntry(
               entry.key,
               _RoomPrefs.fromJson(Map<String, dynamic>.from(entry.value)),
@@ -447,6 +464,18 @@ class _ChatHomePageState extends State<ChatHomePage> {
     );
   }
 
+  Future<void> _saveAcgoConversationPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _prefAcgoConversationPrefs,
+      jsonEncode(
+        _acgoConversationPrefs.map(
+          (key, value) => MapEntry(key, value.toJson()),
+        ),
+      ),
+    );
+  }
+
   Future<void> _saveMessagesForRoom(String roomId) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_prefRoomMessages, jsonEncode(_serializedMessages()));
@@ -508,6 +537,25 @@ class _ChatHomePageState extends State<ChatHomePage> {
 
   List<DiscoveredRoom> get _visibleDiscoveredRooms =>
       _rooms.where((room) => _roomPrefs[room.id]?.hidden != true).toList();
+
+  List<AcgoPrivateConversation> get _visibleAcgoConversations {
+    final visible = _acgoConversations
+        .where(
+          (conversation) =>
+              _acgoConversationPrefs[conversation.id]?.hidden != true,
+        )
+        .toList();
+    return [
+      ...visible.where(
+        (conversation) =>
+            _acgoConversationPrefs[conversation.id]?.pinned == true,
+      ),
+      ...visible.where(
+        (conversation) =>
+            _acgoConversationPrefs[conversation.id]?.pinned != true,
+      ),
+    ];
+  }
 
   DiscoveredRoom? _roomById(String roomId) {
     for (final room in [
@@ -735,7 +783,24 @@ class _ChatHomePageState extends State<ChatHomePage> {
       _error = null;
     });
     try {
-      final conversations = await service.listConversations();
+      final conversations = <AcgoPrivateConversation>[];
+      final seen = <String>{};
+      var cursor = '0';
+      for (var page = 0; page < 50; page++) {
+        final pageConversations = await service.listConversations(
+          lastUserConversations: cursor,
+        );
+        final before = seen.length;
+        for (final conversation in pageConversations) {
+          if (seen.add(conversation.id)) {
+            conversations.add(conversation);
+          }
+        }
+        if (pageConversations.isEmpty || seen.length == before) {
+          break;
+        }
+        cursor = pageConversations.last.id;
+      }
       if (!mounted) return;
       setState(() {
         _acgoConversations = conversations;
@@ -766,7 +831,25 @@ class _ChatHomePageState extends State<ChatHomePage> {
     if (service == null || _loadingAcgoMessages) return;
     setState(() => _loadingAcgoMessages = true);
     try {
-      final messages = await service.listMessages(conversation);
+      final messages = <AcgoPrivateMessage>[];
+      final seen = <String>{};
+      var cursor = '0';
+      for (var page = 0; page < 50; page++) {
+        final pageMessages = await service.listMessages(
+          conversation,
+          messageId: cursor,
+        );
+        final before = seen.length;
+        for (final message in pageMessages) {
+          if (seen.add(message.id)) {
+            messages.add(message);
+          }
+        }
+        if (pageMessages.isEmpty || seen.length == before) {
+          break;
+        }
+        cursor = pageMessages.last.id;
+      }
       if (!mounted) return;
       setState(() {
         _acgoMessagesByConversation[conversation.id] = messages
@@ -865,11 +948,91 @@ class _ChatHomePageState extends State<ChatHomePage> {
           title: 'UID $receiverId',
         );
     if (existing == null) {
-      setState(
-        () => _acgoConversations = [conversation, ..._acgoConversations],
-      );
+      setState(() {
+        _acgoConversations = [conversation, ..._acgoConversations];
+        _acgoConversationPrefs[conversation.id] =
+            (_acgoConversationPrefs[conversation.id] ?? const _RoomPrefs())
+                .copyWith(hidden: false);
+      });
+      unawaited(_saveAcgoConversationPrefs());
+    } else if (_acgoConversationPrefs[existing.id]?.hidden == true) {
+      final existingId = existing.id;
+      setState(() {
+        _acgoConversationPrefs[existingId] = _acgoConversationPrefs[existingId]!
+            .copyWith(hidden: false);
+      });
+      unawaited(_saveAcgoConversationPrefs());
     }
     await _openAcgoConversation(conversation);
+  }
+
+  Future<void> _handleAcgoConversationAction(
+    AcgoPrivateConversation conversation,
+    _AcgoConversationAction action,
+  ) async {
+    final prefs = _acgoConversationPrefs[conversation.id] ?? const _RoomPrefs();
+    if (action == _AcgoConversationAction.pin) {
+      setState(() {
+        _acgoConversationPrefs[conversation.id] = prefs.copyWith(
+          pinned: !prefs.pinned,
+        );
+      });
+      unawaited(_saveAcgoConversationPrefs());
+    } else if (action == _AcgoConversationAction.delete) {
+      setState(() {
+        _acgoConversationPrefs[conversation.id] = prefs.copyWith(
+          hidden: true,
+          pinned: false,
+        );
+        _acgoMessagesByConversation.remove(conversation.id);
+        if (_activeAcgoConversation?.id == conversation.id) {
+          _activeAcgoConversation = null;
+        }
+      });
+      unawaited(_saveAcgoConversationPrefs());
+    }
+  }
+
+  Future<void> _showAcgoConversationContextMenu(
+    AcgoPrivateConversation conversation,
+    Offset position,
+  ) async {
+    final prefs = _acgoConversationPrefs[conversation.id] ?? const _RoomPrefs();
+    final action = await showMenu<_AcgoConversationAction>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        position.dx,
+        position.dy,
+      ),
+      items: [
+        PopupMenuItem(
+          value: _AcgoConversationAction.pin,
+          child: Row(
+            children: [
+              Icon(prefs.pinned ? Icons.push_pin : Icons.push_pin_outlined),
+              const SizedBox(width: 10),
+              Text(prefs.pinned ? '取消置顶' : '置顶'),
+            ],
+          ),
+        ),
+        const PopupMenuDivider(),
+        const PopupMenuItem(
+          value: _AcgoConversationAction.delete,
+          child: Row(
+            children: [
+              Icon(Icons.delete_outline, color: Colors.red),
+              SizedBox(width: 10),
+              Text('删除私信', style: TextStyle(color: Colors.red)),
+            ],
+          ),
+        ),
+      ],
+    );
+    if (action != null) {
+      await _handleAcgoConversationAction(conversation, action);
+    }
   }
 
   ChatMessage _chatMessageFromAcgoMessage(AcgoPrivateMessage message) =>
@@ -2148,13 +2311,14 @@ class _ChatHomePageState extends State<ChatHomePage> {
               '绑定 ACGO 账号后可使用私信',
               style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
             )
-          else if (_acgoConversations.isEmpty && !_loadingAcgoConversations)
+          else if (_visibleAcgoConversations.isEmpty &&
+              !_loadingAcgoConversations)
             Text(
               '暂无私信会话',
               style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
             )
           else
-            ..._acgoConversations.map(
+            ..._visibleAcgoConversations.map(
               (conversation) => Padding(
                 padding: const EdgeInsets.only(bottom: 8),
                 child: _acgoConversationTile(conversation),
@@ -2167,8 +2331,13 @@ class _ChatHomePageState extends State<ChatHomePage> {
 
   Widget _acgoConversationTile(AcgoPrivateConversation conversation) {
     final selected = _activeAcgoConversation?.id == conversation.id;
+    final prefs = _acgoConversationPrefs[conversation.id] ?? const _RoomPrefs();
     return InkWell(
       onTap: () => _openAcgoConversation(conversation),
+      onSecondaryTapDown: (details) => _showAcgoConversationContextMenu(
+        conversation,
+        details.globalPosition,
+      ),
       borderRadius: BorderRadius.circular(8),
       child: Container(
         padding: const EdgeInsets.all(13),
@@ -2222,8 +2391,18 @@ class _ChatHomePageState extends State<ChatHomePage> {
                   style: const TextStyle(color: Colors.white, fontSize: 11),
                 ),
               )
-            else
+            else ...[
+              if (prefs.pinned)
+                const Padding(
+                  padding: EdgeInsets.only(left: 8),
+                  child: Icon(
+                    Icons.push_pin,
+                    size: 15,
+                    color: Color(0xff176b5b),
+                  ),
+                ),
               const Icon(Icons.chevron_right, size: 18, color: Colors.black38),
+            ],
           ],
         ),
       ),

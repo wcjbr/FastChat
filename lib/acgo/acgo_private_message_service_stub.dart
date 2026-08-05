@@ -37,13 +37,16 @@ class AcgoPrivateMessage {
 class AcgoPrivateMessageService {
   AcgoPrivateMessageService({required String accessToken, String? myUserId});
 
-  Future<List<AcgoPrivateConversation>> listConversations() async {
+  Future<List<AcgoPrivateConversation>> listConversations({
+    String lastUserConversations = '0',
+  }) async {
     throw UnsupportedError('当前平台不支持 ACGO 私信。');
   }
 
   Future<List<AcgoPrivateMessage>> listMessages(
-    AcgoPrivateConversation conversation,
-  ) async {
+    AcgoPrivateConversation conversation, {
+    String messageId = '0',
+  }) async {
     throw UnsupportedError('当前平台不支持 ACGO 私信。');
   }
 

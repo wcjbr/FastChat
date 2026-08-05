@@ -13,8 +13,12 @@ class AcgoPrivateMessageService {
   final AcgoClient _client;
   final String? _myUserId;
 
-  Future<List<AcgoPrivateConversation>> listConversations() async {
-    final payload = await _client.listPrivateConversations();
+  Future<List<AcgoPrivateConversation>> listConversations({
+    String lastUserConversations = '0',
+  }) async {
+    final payload = await _client.listPrivateConversations(
+      lastUserConversations: lastUserConversations,
+    );
     final items = _firstList(payload, ['list', 'records', 'items', 'data']);
     return items
         .whereType<Map>()
@@ -24,9 +28,13 @@ class AcgoPrivateMessageService {
   }
 
   Future<List<AcgoPrivateMessage>> listMessages(
-    AcgoPrivateConversation conversation,
-  ) async {
-    final payload = await _client.listPrivateMessages(conversation.id);
+    AcgoPrivateConversation conversation, {
+    String messageId = '0',
+  }) async {
+    final payload = await _client.listPrivateMessages(
+      conversation.id,
+      messageId: messageId,
+    );
     final items = _firstList(payload, ['list', 'records', 'items', 'data']);
     final messages = items
         .whereType<Map>()
