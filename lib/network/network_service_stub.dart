@@ -76,7 +76,7 @@ class ChatNetworkService {
   final transfers = const Stream<FileTransferStatus>.empty();
   String get roomId => '';
   int get port => 0;
-  void startDiscovery() {}
+  Future<void> startDiscovery() async {}
   Future<DiscoveredRoom> hostRoom({
     required String name,
     required bool relay,

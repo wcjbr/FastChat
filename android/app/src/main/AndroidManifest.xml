@@ -35,8 +35,8 @@
             android:name="flutterEmbedding"
             android:value="2" />
         <provider
-            android:name="com.mix1009.android.pasteboard.PasteboardFileProvider"
-            android:authorities="${applicationId}.pasteboard.fileprovider"
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.provider"
             android:exported="false"
             android:grantUriPermissions="true">
             <meta-data

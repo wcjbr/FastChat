@@ -354,7 +354,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
     });
     NotificationService.initialize();
     _loadPreferences();
-    _network.startDiscovery();
+    unawaited(_startDiscoverySafely());
     _scanTimer = Timer(const Duration(seconds: 4), () {
       if (mounted) {
         setState(() => _scanning = false);
@@ -1088,13 +1088,23 @@ class _ChatHomePageState extends State<ChatHomePage> {
 
   void _scan() {
     setState(() => _scanning = true);
-    _network.startDiscovery();
+    unawaited(_startDiscoverySafely());
     _scanTimer?.cancel();
     _scanTimer = Timer(const Duration(seconds: 4), () {
       if (mounted) {
         setState(() => _scanning = false);
       }
     });
+  }
+
+  Future<void> _startDiscoverySafely() async {
+    try {
+      await _network.startDiscovery();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = '局域网发现不可用：$e');
+      }
+    }
   }
 
   Future<void> _createRoom() async {

@@ -42,13 +42,28 @@ class ChatNetworkService {
   DiscoveredRoom? get activeRoom => _rooms[_activeRoomId]?.room;
 
   Future<void> startDiscovery() async {
-    _udp ??= await RawDatagramSocket.bind(
-      InternetAddress.anyIPv4,
-      _discoveryPort,
-      reuseAddress: true,
-      reusePort: true,
-    );
-    _udp!.broadcastEnabled = true;
+    if (_udp != null) return;
+    try {
+      _udp = await RawDatagramSocket.bind(
+        InternetAddress.anyIPv4,
+        _discoveryPort,
+        reuseAddress: true,
+        reusePort: true,
+      );
+    } catch (_) {
+      try {
+        _udp = await RawDatagramSocket.bind(
+          InternetAddress.anyIPv4,
+          _discoveryPort,
+          reuseAddress: true,
+        );
+      } catch (_) {
+        return;
+      }
+    }
+    try {
+      _udp!.broadcastEnabled = true;
+    } catch (_) {}
     _udpSubscription ??= _udp!.listen((event) {
       if (event != RawSocketEvent.read) return;
       final packet = _udp!.receive();
