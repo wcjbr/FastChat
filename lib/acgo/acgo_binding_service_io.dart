@@ -1,3 +1,5 @@
+import 'dart:collection';
+
 import 'package:acgo_sdk/acgo_sdk.dart';
 
 import 'acgo_http_client_io.dart';
@@ -69,19 +71,20 @@ class AcgoBindingService {
   }
 
   String? _findFirstString(Object? payload, List<String> keys) {
-    if (payload is Map) {
-      for (final key in keys) {
-        final value = payload[key];
-        if (value is String && value.isNotEmpty) return value;
-      }
-      for (final value in payload.values) {
-        final found = _findFirstString(value, keys);
-        if (found != null) return found;
-      }
-    } else if (payload is List) {
-      for (final item in payload) {
-        final found = _findFirstString(item, keys);
-        if (found != null) return found;
+    final seen = HashSet.identity();
+    final stack = <Object?>[payload];
+    while (stack.isNotEmpty) {
+      final current = stack.removeLast();
+      if (current is Map) {
+        if (!seen.add(current)) continue;
+        for (final key in keys) {
+          final value = current[key];
+          if (value is String && value.isNotEmpty) return value;
+        }
+        stack.addAll(current.values);
+      } else if (current is List) {
+        if (!seen.add(current)) continue;
+        stack.addAll(current.reversed);
       }
     }
     return null;
@@ -173,20 +176,25 @@ class AcgoBindingService {
   ];
 
   void _collectUsefulFields(Object? value, Map<String, dynamic> out) {
-    if (value is Map) {
-      for (final entry in value.entries) {
-        final key = entry.key.toString();
-        final item = entry.value;
-        if (item is String || item is num || item is bool) {
-          out.putIfAbsent(key, () => item);
+    final seen = HashSet.identity();
+    final stack = <Object?>[value];
+    while (stack.isNotEmpty) {
+      final current = stack.removeLast();
+      if (current is Map) {
+        if (!seen.add(current)) continue;
+        for (final entry in current.entries) {
+          final key = entry.key.toString();
+          final item = entry.value;
+          if (item is String || item is num || item is bool) {
+            out.putIfAbsent(key, () => item);
+          }
+          if (item is Map || item is List) {
+            stack.add(item);
+          }
         }
-        if (item is Map || item is List) {
-          _collectUsefulFields(item, out);
-        }
-      }
-    } else if (value is List) {
-      for (final item in value) {
-        _collectUsefulFields(item, out);
+      } else if (current is List) {
+        if (!seen.add(current)) continue;
+        stack.addAll(current);
       }
     }
   }
