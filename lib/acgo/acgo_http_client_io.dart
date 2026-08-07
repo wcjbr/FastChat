@@ -6,15 +6,9 @@ class FastChatAcgoHttp {
   const FastChatAcgoHttp._();
 
   static AcgoClient createClient({String? accessToken}) {
-    return HttpOverrides.runZoned(
+    return HttpOverrides.runWithHttpOverrides(
       () => AcgoClient(accessToken: accessToken),
-      createHttpClient: (context) {
-        final client = HttpClient(context: context);
-        client.badCertificateCallback = (certificate, host, port) {
-          return _isAcgoHost(host);
-        };
-        return client;
-      },
+      _AcgoHttpOverrides(),
     );
   }
 
@@ -24,5 +18,16 @@ class FastChatAcgoHttp {
         normalized.endsWith('.acgo.cn') ||
         normalized == 'xiaomawang.com' ||
         normalized.endsWith('.xiaomawang.com');
+  }
+}
+
+class _AcgoHttpOverrides extends HttpOverrides {
+  @override
+  HttpClient createHttpClient(SecurityContext? context) {
+    final client = super.createHttpClient(context);
+    client.badCertificateCallback = (certificate, host, port) {
+      return FastChatAcgoHttp._isAcgoHost(host);
+    };
+    return client;
   }
 }
