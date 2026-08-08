@@ -16,13 +16,20 @@ class AcgoE2ee {
 
   static const keyPrefix = '[FastChat:E2EE-Key:v1]';
   static const messagePrefix = '[FastChat:E2EE:v1]';
+  static const messagePartPrefix = '[FastChat:E2EE-Part:v1]';
+  static const acgoEncryptedPartMaxLength = 450;
 
   static bool isProtocolText(String text) =>
-      text.startsWith(keyPrefix) || text.startsWith(messagePrefix);
+      text.startsWith(keyPrefix) ||
+      text.startsWith(messagePrefix) ||
+      text.startsWith(messagePartPrefix);
 
   static bool isKeyAdvert(String text) => text.startsWith(keyPrefix);
 
   static bool isEncryptedMessage(String text) => text.startsWith(messagePrefix);
+
+  static bool isEncryptedMessagePart(String text) =>
+      text.startsWith(messagePartPrefix);
 
   static AcgoE2eeIdentity generateIdentity() {
     final generator = RSAKeyGenerator()
@@ -128,6 +135,52 @@ class AcgoE2ee {
     return '$messagePrefix${jsonEncode({'k': _b64(wrappedKey), if (selfWrappedKey != null) 'sk': _b64(selfWrappedKey), 'iv': _b64(iv), 'c': _b64(cipherText), 'm': _b64(mac)})}';
   }
 
+  static List<String> encryptTextParts(
+    String text,
+    RSAPublicKey peerPublicKey, {
+    RSAPublicKey? selfPublicKey,
+    int maxPartLength = acgoEncryptedPartMaxLength,
+  }) {
+    final encrypted = encryptText(
+      text,
+      peerPublicKey,
+      selfPublicKey: selfPublicKey,
+    );
+    if (encrypted.length <= maxPartLength) return [encrypted];
+    final partId = _b64(_randomBytes(12));
+    return _splitEncryptedText(encrypted, partId, maxPartLength);
+  }
+
+  static AcgoE2eeMessagePart? tryReadMessagePart(String text) {
+    if (!isEncryptedMessagePart(text)) return null;
+    final body = text.substring(messagePartPrefix.length);
+    final idEnd = body.indexOf(':');
+    if (idEnd <= 0) return null;
+    final indexEnd = body.indexOf(':', idEnd + 1);
+    if (indexEnd <= idEnd + 1) return null;
+    final totalEnd = body.indexOf(':', indexEnd + 1);
+    if (totalEnd <= indexEnd + 1) return null;
+    final id = body.substring(0, idEnd);
+    final index = int.tryParse(body.substring(idEnd + 1, indexEnd));
+    final total = int.tryParse(body.substring(indexEnd + 1, totalEnd));
+    final data = body.substring(totalEnd + 1);
+    if (id.isEmpty ||
+        index == null ||
+        total == null ||
+        index < 1 ||
+        total < 1 ||
+        index > total ||
+        data.isEmpty) {
+      return null;
+    }
+    return AcgoE2eeMessagePart(
+      id: id,
+      index: index,
+      total: total,
+      data: data,
+    );
+  }
+
   static String? tryDecryptText(String text, RSAPrivateKey privateKey) {
     if (!isEncryptedMessage(text)) return null;
     try {
@@ -158,6 +211,37 @@ class AcgoE2ee {
     } catch (_) {
       return null;
     }
+  }
+
+  static List<String> _splitEncryptedText(
+    String encrypted,
+    String partId,
+    int maxPartLength,
+  ) {
+    var expectedTotal = 1;
+    for (var attempt = 0; attempt < 20; attempt++) {
+      final parts = <String>[];
+      var offset = 0;
+      var index = 1;
+      while (offset < encrypted.length) {
+        final header = '$messagePartPrefix$partId:$index:$expectedTotal:';
+        final capacity = maxPartLength - header.length;
+        if (capacity <= 0) {
+          throw ArgumentError.value(
+            maxPartLength,
+            'maxPartLength',
+            '分段长度过短，无法容纳 FastChat 加密分片头。',
+          );
+        }
+        final end = min(offset + capacity, encrypted.length);
+        parts.add('$header${encrypted.substring(offset, end)}');
+        offset = end;
+        index++;
+      }
+      if (parts.length == expectedTotal) return parts;
+      expectedTotal = parts.length;
+    }
+    throw StateError('无法稳定计算 FastChat 加密消息分片。');
   }
 
   static Map<String, String> _publicKeyToJson(RSAPublicKey publicKey) => {
@@ -261,4 +345,18 @@ class AcgoE2ee {
     }
     return diff == 0;
   }
+}
+
+class AcgoE2eeMessagePart {
+  const AcgoE2eeMessagePart({
+    required this.id,
+    required this.index,
+    required this.total,
+    required this.data,
+  });
+
+  final String id;
+  final int index;
+  final int total;
+  final String data;
 }

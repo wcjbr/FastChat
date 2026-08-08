@@ -1272,14 +1272,11 @@ class _ChatHomePageState extends State<ChatHomePage> {
         cursor = pageMessages.last.id;
       }
       if (!mounted) return;
-      final chatMessages = <ChatMessage>[];
+      final chatMessages = _chatMessagesFromAcgoMessages(
+        messages,
+        conversation,
+      );
       final peerKeyCountBefore = _acgoPeerKeys.length;
-      for (final message in messages) {
-        final chatMessage = _chatMessageFromAcgoMessage(message, conversation);
-        if (chatMessage != null) {
-          chatMessages.add(chatMessage);
-        }
-      }
       if (_acgoPeerKeys.length != peerKeyCountBefore) {
         unawaited(_saveAcgoPeerKeys());
       }
@@ -1308,14 +1305,18 @@ class _ChatHomePageState extends State<ChatHomePage> {
       final peerKey = _acgoPeerKeys[conversation.receiverId];
       final identity = _acgoE2eeIdentity;
       final encrypted = peerKey != null && identity != null;
-      final outgoingText = encrypted
-          ? AcgoE2ee.encryptText(
-              text,
-              peerKey,
-              selfPublicKey: identity.publicKey,
-            )
-          : text;
-      await service.sendText(conversation: conversation, text: outgoingText);
+      if (encrypted) {
+        final outgoingParts = AcgoE2ee.encryptTextParts(
+          text,
+          peerKey,
+          selfPublicKey: identity.publicKey,
+        );
+        for (final part in outgoingParts) {
+          await service.sendText(conversation: conversation, text: part);
+        }
+      } else {
+        await service.sendText(conversation: conversation, text: text);
+      }
       if (!mounted) return;
       final message = ChatMessage(
         sender: _nameController.text.trim().isEmpty
@@ -1489,26 +1490,84 @@ class _ChatHomePageState extends State<ChatHomePage> {
     );
   }
 
-  ChatMessage? _chatMessageFromAcgoMessage(
-    AcgoPrivateMessage message,
+  List<ChatMessage> _chatMessagesFromAcgoMessages(
+    List<AcgoPrivateMessage> messages,
     AcgoPrivateConversation conversation,
   ) {
-    final key = AcgoE2ee.tryReadKeyAdvert(message.text);
-    if (key != null && !message.mine) {
-      _acgoPeerKeys[conversation.receiverId] = key;
-      return null;
-    }
-    if (AcgoE2ee.isKeyAdvert(message.text)) {
-      return null;
-    }
+    final chatMessages = <ChatMessage>[];
+    for (var i = 0; i < messages.length; i++) {
+      final message = messages[i];
+      final key = AcgoE2ee.tryReadKeyAdvert(message.text);
+      if (key != null && !message.mine) {
+        _acgoPeerKeys[conversation.receiverId] = key;
+        continue;
+      }
+      if (AcgoE2ee.isKeyAdvert(message.text)) {
+        continue;
+      }
 
-    var text = message.text;
+      final part = AcgoE2ee.tryReadMessagePart(message.text);
+      if (part != null) {
+        final parts = <AcgoE2eeMessagePart>[];
+        var j = i;
+        while (j < messages.length) {
+          final currentPart = AcgoE2ee.tryReadMessagePart(messages[j].text);
+          if (currentPart == null || currentPart.id != part.id) {
+            break;
+          }
+          parts.add(currentPart);
+          if (parts.length == part.total) {
+            break;
+          }
+          j++;
+        }
+        if (parts.length == part.total) {
+          parts.sort((a, b) => a.index.compareTo(b.index));
+          final complete = parts.first.index == 1 &&
+              parts.last.index == part.total &&
+              parts.every((item) => item.total == part.total) &&
+              parts.every((item) => item.index >= 1 && item.index <= part.total);
+          if (complete) {
+            final combinedText = parts.map((item) => item.data).join();
+            final chatMessage = _chatMessageFromAcgoText(
+              message,
+              combinedText,
+              conversation,
+            );
+            if (chatMessage != null) {
+              chatMessages.add(chatMessage);
+              i = j;
+              continue;
+            }
+          }
+        }
+        continue;
+      }
+
+      final chatMessage = _chatMessageFromAcgoText(
+        message,
+        message.text,
+        conversation,
+      );
+      if (chatMessage != null) {
+        chatMessages.add(chatMessage);
+      }
+    }
+    return chatMessages;
+  }
+
+  ChatMessage? _chatMessageFromAcgoText(
+    AcgoPrivateMessage message,
+    String text,
+    AcgoPrivateConversation conversation,
+  ) {
+    var displayText = text;
     final identity = _acgoE2eeIdentity;
-    if (AcgoE2ee.isEncryptedMessage(text)) {
+    if (AcgoE2ee.isEncryptedMessage(displayText)) {
       final decrypted = identity == null
           ? null
-          : AcgoE2ee.tryDecryptText(text, identity.privateKey);
-      text = decrypted ?? '无法解密的 FastChat 加密消息';
+          : AcgoE2ee.tryDecryptText(displayText, identity.privateKey);
+      displayText = decrypted ?? '无法解密的 FastChat 加密消息';
     }
 
     return ChatMessage(
@@ -1517,7 +1576,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
                 ? '我'
                 : _nameController.text.trim())
           : message.senderName,
-      text: text,
+      text: displayText,
       roomId: _acgoRoomId(message.conversationId),
       senderSignature: message.mine ? _signatureController.text.trim() : null,
       senderBirthday: message.mine ? _birthday : null,
